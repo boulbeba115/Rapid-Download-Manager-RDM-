@@ -87,6 +87,7 @@ pub struct RdmApp {
     tray: Option<Tray>,
     /// The window is hidden in the notification area.
     hidden: bool,
+    hide_asserted: u8,
     /// Downloads started with `/q`: exit once they have all finished.
     quit_after: BTreeSet<Id>,
     /// Short message shown in the status bar for a few seconds.
@@ -166,6 +167,7 @@ impl RdmApp {
             clipboard_checked: Instant::now(),
             tray,
             hidden,
+            hide_asserted: 0,
             quit_after: BTreeSet::new(),
             notice: None,
             api_status,
@@ -1113,6 +1115,13 @@ impl eframe::App for RdmApp {
     /// Runs every frame, and also while the window is hidden in the tray —
     /// so everything that must work without a visible window lives here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The windowing layer shows the window after its first frame no matter how it
+        // was created, so a "start hidden" has to be re-asserted for the first few frames.
+        if self.hidden && self.hide_asserted < 3 {
+            self.hide_asserted += 1;
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
+            ctx.request_repaint();
+        }
         self.handle_tray(ctx);
         self.handle_events(ctx);
         self.watch_clipboard(ctx);

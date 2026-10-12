@@ -28,6 +28,10 @@ fn parse_args() -> Launch {
 /// Settings live next to the executable when a `portable.txt` marker (or an
 /// existing `data` folder) is there, otherwise in `%APPDATA%\RDM`.
 fn default_data_dir() -> PathBuf {
+    // Explicit override, e.g. for automated tests that must not touch the real profile.
+    if let Some(dir) = std::env::var_os("RDM_DATA_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) {
         if dir.join("portable.txt").exists() || dir.join("data").join("config.json").exists() {
             return dir.join("data");
