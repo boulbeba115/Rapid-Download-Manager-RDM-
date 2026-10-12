@@ -129,6 +129,7 @@ async fn handle(mut stream: TcpStream, manager: WeakManager) {
         }
         ("POST", "/add") if from_extension || from_native => match serde_json::from_slice::<AddRequest>(&req.body) {
             Ok(add) if is_http_url(&add.url) => {
+                log::info!("add request from {}: {}", if from_extension { "the browser extension" } else { "a local client" }, add.url);
                 manager.push_event(Event::AddRequest(add));
                 respond(&mut stream, "200 OK", ext_origin, r#"{"ok":true}"#).await
             }
@@ -171,7 +172,8 @@ pub fn parse_cli(args: &[String]) -> Vec<Event> {
                 add.queue_only = true;
             }
             Some("s") => events.push(Event::StartQueue(MAIN_QUEUE)),
-            // `/q` (exit when done) and `/h` (hang up) have no equivalent here yet.
+            Some("q") => add.quit_when_done = true,
+            // `/h` (hang up the modem) has no equivalent.
             Some(_) => {}
             None if is_http_url(arg) && add.url.is_empty() => add.url = arg.clone(),
             None => {}

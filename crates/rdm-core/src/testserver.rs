@@ -37,6 +37,12 @@ pub struct ServerOptions {
     /// Accept at most this many requests per window; the rest get `429` with
     /// `Retry-After`. Rejected requests extend nothing and count for nothing.
     pub request_limit: Option<(usize, Duration)>,
+    /// Demand these HTTP Basic credentials (`401` otherwise).
+    pub require_auth: Option<(String, String)>,
+    /// The first N connections accepted are throttled to `slow_rate` bytes/s
+    /// (a congested route / bad CDN node).
+    pub slow_connections: u64,
+    pub slow_rate: u64,
 }
 
 impl ServerOptions {
@@ -55,6 +61,9 @@ impl ServerOptions {
             latency: Duration::ZERO,
             force_status: None,
             request_limit: None,
+            require_auth: None,
+            slow_connections: 0,
+            slow_rate: 0,
         }
     }
 }
@@ -101,8 +110,8 @@ impl TestServer {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { break };
                 let _ = stream.set_nodelay(true);
-                s.connections.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(serve_connection(stream, o.clone(), s.clone(), d.clone()));
+                let conn_index = s.connections.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(serve_connection(stream, o.clone(), s.clone(), d.clone(), conn_index));
             }
         });
         Self { addr, opts, drops_left, stats, accept }
@@ -171,6 +180,7 @@ pub fn verify_file(path: &Path, seed: u64, size: u64) -> Result<(), String> {
 struct Request {
     range: Option<(u64, Option<u64>)>,
     if_range: Option<String>,
+    authorization: Option<String>,
 }
 
 async fn read_request(stream: &mut TcpStream, carry: &mut Vec<u8>) -> Option<Request> {
@@ -178,7 +188,7 @@ async fn read_request(stream: &mut TcpStream, carry: &mut Vec<u8>) -> Option<Req
         if let Some(end) = carry.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&carry[..end]).into_owned();
             carry.drain(..end + 4);
-            let mut req = Request { range: None, if_range: None };
+            let mut req = Request { range: None, if_range: None, authorization: None };
             for line in head.lines().skip(1) {
                 let Some((k, v)) = line.split_once(':') else { continue };
                 let v = v.trim();
@@ -191,6 +201,7 @@ async fn read_request(stream: &mut TcpStream, carry: &mut Vec<u8>) -> Option<Req
                         }
                     }
                     "if-range" => req.if_range = Some(v.to_string()),
+                    "authorization" => req.authorization = Some(v.to_string()),
                     _ => {}
                 }
             }
@@ -214,7 +225,7 @@ impl Drop for Slot {
     }
 }
 
-async fn serve_connection(mut stream: TcpStream, opts: Arc<Mutex<ServerOptions>>, stats: Arc<Stats>, drops_left: Arc<AtomicI64>) {
+async fn serve_connection(mut stream: TcpStream, opts: Arc<Mutex<ServerOptions>>, stats: Arc<Stats>, drops_left: Arc<AtomicI64>, conn_index: u64) {
     let mut carry = Vec::new();
     let mut chunk = vec![0u8; 256 * 1024];
     loop {
@@ -223,6 +234,23 @@ async fn serve_connection(mut stream: TcpStream, opts: Arc<Mutex<ServerOptions>>
         let o = opts.lock().clone();
         if !o.latency.is_zero() {
             tokio::time::sleep(o.latency).await;
+        }
+
+        if let Some((user, pass)) = &o.require_auth {
+            use base64::Engine;
+            let want = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}")));
+            if req.authorization.as_deref() != Some(want.as_str()) {
+                stats.rejected.fetch_add(1, Ordering::Relaxed);
+                let head = "HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm=\"test\"
+Content-Length: 0
+
+";
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
         }
 
         if let Some(code) = o.force_status {
@@ -315,7 +343,8 @@ async fn serve_connection(mut stream: TcpStream, opts: Arc<Mutex<ServerOptions>>
             Some(n) if drops_left.fetch_sub(1, Ordering::Relaxed) > 0 => Some(n),
             _ => None,
         };
-        let step = if o.per_conn_rate == 0 { chunk.len() } else { ((o.per_conn_rate / 20) as usize).clamp(512, chunk.len()) };
+        let rate = if conn_index < o.slow_connections { o.slow_rate.max(1) } else { o.per_conn_rate };
+        let step = if rate == 0 { chunk.len() } else { ((rate / 20) as usize).clamp(512, chunk.len()) };
         let started = tokio::time::Instant::now();
         let mut sent = 0u64;
         let mut pos = start;
@@ -335,9 +364,9 @@ async fn serve_connection(mut stream: TcpStream, opts: Arc<Mutex<ServerOptions>>
             pos += n as u64;
             sent += n as u64;
             stats.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-            if o.per_conn_rate > 0 {
+            if rate > 0 {
                 // Pace against the wall clock so sleep granularity does not accumulate.
-                let due = started + Duration::from_secs_f64(sent as f64 / o.per_conn_rate as f64);
+                let due = started + Duration::from_secs_f64(sent as f64 / rate as f64);
                 tokio::time::sleep_until(due).await;
             }
         }

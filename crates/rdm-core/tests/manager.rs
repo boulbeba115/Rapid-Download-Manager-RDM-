@@ -1,68 +1,17 @@
 //! Manager-level tests: list, naming, persistence, queues, removal (SPEC.md §6–7).
 
-use std::path::PathBuf;
+
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use rdm_core::http::{ProxyConfig, RequestSpec};
 use rdm_core::manager::{Event, PostAction, MAIN_QUEUE};
 use rdm_core::task::Connections;
-use rdm_core::testserver::{verify_file, ServerOptions, TestServer};
-use rdm_core::{Manager, NewDownload, Status};
+use rdm_core::testserver::{verify_file, ServerOptions};
+use rdm_core::{NewDownload, Status};
 
-const MIB: u64 = 1024 * 1024;
-
-struct Fixture {
-    root: PathBuf,
-    manager: Manager,
-}
-
-impl Fixture {
-    fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join("rdm-tests").join(format!("mgr-{name}-{}-{}", std::process::id(), fastrand::u32(..)));
-        std::fs::create_dir_all(&root).unwrap();
-        let fx = Self { manager: Self::open(&root), root };
-        // Keep downloads inside the fixture and off the machine's proxy.
-        let mut cfg = fx.manager.config();
-        cfg.categories = rdm_core::category::defaults(&fx.root.join("downloads"));
-        cfg.net.proxy = ProxyConfig::None;
-        cfg.api_port = 0;
-        fx.manager.set_config(cfg).unwrap();
-        fx
-    }
-
-    fn open(root: &PathBuf) -> Manager {
-        Manager::new(root.join("data"), || {}).unwrap()
-    }
-
-    fn server(&self, opts: ServerOptions) -> TestServer {
-        self.manager.runtime().block_on(TestServer::start(opts))
-    }
-
-    /// Collect events until `pred` matches one, or fail after `secs`.
-    fn wait_event(&self, secs: u64, mut pred: impl FnMut(&Event) -> bool) -> Vec<Event> {
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        let mut seen = Vec::new();
-        loop {
-            for e in self.manager.take_events() {
-                let hit = pred(&e);
-                seen.push(e);
-                if hit {
-                    return seen;
-                }
-            }
-            assert!(Instant::now() < deadline, "timed out; events so far: {seen:?}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        self.manager.shutdown();
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
+mod common;
+use common::{Fixture, MIB};
 
 #[test]
 fn names_places_downloads_and_persists() {

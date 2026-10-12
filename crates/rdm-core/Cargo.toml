@@ -9,7 +9,10 @@ license.workspace = true
 testserver = []
 
 [dependencies]
+aes = "0.9.3"
+base64 = "0.23.1"
 bytes = "1.12.1"
+cbc = { version = "0.2.1", features = ["alloc"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
 dirs = "7.0.0"
 fastrand = "2.5.0"

@@ -14,6 +14,8 @@ use tokio::sync::watch;
 
 use crate::category::{self, Category};
 use crate::filename::{self, part_path, state_path};
+use crate::grabber::{self, GrabbedLink};
+use crate::hls;
 use crate::http::{self, build_client, NetConfig, Probe, RemoteInfo, RequestSpec};
 use crate::limiter::RateLimiter;
 use crate::segment::SegSnapshot;
@@ -69,6 +71,8 @@ pub struct Config {
     pub capture_extensions: Vec<String>,
     pub api_port: u16,
     pub dark_mode: bool,
+    /// Closing the window keeps RDM running in the notification area.
+    pub close_to_tray: bool,
     pub site_logins: Vec<SiteLogin>,
     pub site_limits: Vec<SiteLimit>,
 }
@@ -94,6 +98,7 @@ impl Default for Config {
             capture_extensions,
             api_port: DEFAULT_API_PORT,
             dark_mode: false,
+            close_to_tray: true,
             site_logins: Vec::new(),
             site_limits: Vec::new(),
         }
@@ -131,6 +136,12 @@ pub struct Download {
     pub completed_at: Option<DateTime<Local>>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Checksum the finished file must match, as the user entered it.
+    #[serde(default)]
+    pub expected_hash: Option<String>,
+    /// Result of that check once it has run.
+    #[serde(default)]
+    pub verified: Option<bool>,
     /// The name was chosen by the user or already confirmed by the server;
     /// otherwise it is a guess from the URL that the first response may correct.
     #[serde(default = "yes")]
@@ -226,6 +237,8 @@ pub struct AddRequest {
     pub silent: bool,
     /// With `silent`: queue it instead of starting right away.
     pub queue_only: bool,
+    /// Close the application once this download has finished (IDM `/q`).
+    pub quit_when_done: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +267,8 @@ pub struct NewDownload {
     pub probe: Option<Probe>,
     pub connections: Option<Connections>,
     pub speed_limit: u64,
+    /// MD5, SHA-1 or SHA-256 the finished file must match.
+    pub expected_hash: Option<String>,
 }
 
 impl NewDownload {
@@ -269,6 +284,7 @@ impl NewDownload {
             probe: None,
             connections: None,
             speed_limit: 0,
+            expected_hash: None,
         }
     }
 }
@@ -308,6 +324,64 @@ impl ProbeTicket {
             }
         }
     }
+}
+
+/// A link-grabbing job running in the background; poll it from the UI thread.
+#[derive(Clone)]
+pub struct GrabTicket {
+    slot: Arc<Mutex<Option<Result<Vec<GrabbedLink>, String>>>>,
+}
+
+impl GrabTicket {
+    /// `None` while the page is still being fetched.
+    pub fn result(&self) -> Option<Result<Vec<GrabbedLink>, String>> {
+        self.slot.lock().clone()
+    }
+}
+
+/// One entry of an exported / imported list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListItem {
+    pub url: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    #[serde(default)]
+    pub referer: Option<String>,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Understands RDM's JSON export, a JSON array of addresses, a plain text
+/// list (one address per line) and Windows `.url` shortcuts (`URL=…`).
+/// Anything that is not an http(s) address is ignored.
+pub fn parse_list(text: &str) -> Vec<ListItem> {
+    let text = text.trim_start_matches('\u{feff}');
+    let is_web = |u: &str| u.starts_with("http://") || u.starts_with("https://");
+    let bare = |url: &str| ListItem { url: url.to_string(), file_name: None, dir: None, referer: None, description: String::new() };
+    if let Ok(items) = serde_json::from_str::<Vec<ListItem>>(text) {
+        return items.into_iter().filter(|i| is_web(&i.url)).collect();
+    }
+    if let Ok(urls) = serde_json::from_str::<Vec<String>>(text) {
+        return urls.iter().map(|u| u.trim()).filter(|u| is_web(u)).map(bare).collect();
+    }
+    text.lines()
+        .map(|l| l.trim())
+        .map(|l| l.strip_prefix("URL=").unwrap_or(l).trim())
+        .filter(|l| is_web(l) && !l.contains(char::is_whitespace))
+        .map(bare)
+        .collect()
+}
+
+/// Whether a queue's schedule fires at this weekday (Monday = 0) and time:
+/// `(start, stop)`.
+pub fn schedule_due(s: &Schedule, weekday: usize, hour: u32, minute: u32) -> (bool, bool) {
+    let day_ok = s.days.iter().all(|d| !d) || s.days.get(weekday).copied().unwrap_or(false);
+    let start = s.start_enabled && day_ok && (hour, minute) == (s.start_hour, s.start_minute);
+    let stop = s.stop_enabled && (hour, minute) == (s.stop_hour, s.stop_minute);
+    (start, stop)
 }
 
 struct Live {
@@ -571,6 +645,8 @@ impl Manager {
                 last_try_at: None,
                 completed_at: None,
                 error: None,
+                expected_hash: new.expected_hash.filter(|h| !h.trim().is_empty()),
+                verified: None,
                 name_final,
                 auto_place,
             });
@@ -683,6 +759,88 @@ impl Manager {
             d.status = Status::Paused;
         }
         st.dirty = true;
+    }
+
+    pub fn set_expected_hash(&self, id: Id, hash: Option<String>) {
+        let mut st = self.inner.state.lock();
+        if let Some(d) = st.downloads.iter_mut().find(|d| d.id == id) {
+            d.expected_hash = hash.filter(|h| !h.trim().is_empty());
+            d.verified = None;
+            st.dirty = true;
+        }
+    }
+
+    // ---- Link grabber, import, export ----------------------------------
+
+    /// Fetch a page in the background and list the files it links to.
+    pub fn grab(&self, spec: RequestSpec, extensions: Vec<String>) -> GrabTicket {
+        let ticket = GrabTicket { slot: Arc::new(Mutex::new(None)) };
+        let (t, inner) = (ticket.clone(), self.inner.clone());
+        self.inner.rt().spawn(async move {
+            let spec = inner.with_site_login(spec);
+            let client = inner.client.lock().clone();
+            let res = tokio::time::timeout(Duration::from_secs(45), grabber::grab(&client, &spec, &extensions)).await;
+            *t.slot.lock() = Some(match res {
+                Ok(Ok(links)) => Ok(links),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("timed out waiting for the server".into()),
+            });
+            (inner.notify)();
+        });
+        ticket
+    }
+
+    /// Write the list to `path`: one address per line for `.txt`, otherwise
+    /// JSON that `import_list` reads back with names, folders and notes.
+    pub fn export_list(&self, path: &Path) -> std::io::Result<usize> {
+        let items: Vec<ListItem> = {
+            let st = self.inner.state.lock();
+            st.downloads
+                .iter()
+                .map(|d| ListItem {
+                    url: d.spec.url.clone(),
+                    file_name: Some(d.file_name.clone()),
+                    dir: Some(d.dir.clone()),
+                    referer: d.spec.referer.clone(),
+                    description: d.description.clone(),
+                })
+                .collect()
+        };
+        let is_text = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("txt"));
+        if is_text {
+            let text: String = items.iter().map(|i| format!("{}\r\n", i.url)).collect();
+            std::fs::write(path, text)?;
+        } else {
+            save_json(path, &items)?;
+        }
+        Ok(items.len())
+    }
+
+    /// Add every address found in `path` (an export file, a plain list of
+    /// links, or a Windows `.url` shortcut) to the list without starting it.
+    /// Addresses already in the list are skipped. Returns how many were added.
+    pub fn import_list(&self, path: &Path) -> std::io::Result<usize> {
+        let data = std::fs::read(path)?;
+        if data.len() > 32 * 1024 * 1024 {
+            return Err(std::io::Error::other("the file is too large to be a list of links"));
+        }
+        let items = parse_list(&String::from_utf8_lossy(&data));
+        let known: HashSet<String> = self.inner.state.lock().downloads.iter().map(|d| d.spec.url.clone()).collect();
+        let mut added = 0;
+        let mut seen = known;
+        for item in items {
+            if !seen.insert(item.url.clone()) {
+                continue;
+            }
+            let mut new = NewDownload::new(RequestSpec { url: item.url, referer: item.referer, ..Default::default() });
+            new.file_name = item.file_name;
+            new.dir = item.dir;
+            new.description = item.description;
+            new.start = false;
+            self.add(new);
+            added += 1;
+        }
+        Ok(added)
     }
 
     pub fn set_config(&self, config: Config) -> crate::Result<()> {
@@ -862,9 +1020,100 @@ impl Inner {
         }
         let me = self.clone();
         self.rt().spawn(async move {
-            let (outcome, progress) = me.clone().run_download(id, probe, cancel, cancel_rx).await;
+            let (mut outcome, progress) = me.clone().run_download(id, probe, cancel, cancel_rx).await;
+            if outcome == Outcome::Complete {
+                if let Err(msg) = me.verify_checksum(id).await {
+                    outcome = Outcome::Failed(msg);
+                }
+            }
             me.finish(id, outcome, progress);
         });
+    }
+
+    /// Check a finished file against the checksum the user gave, if any.
+    async fn verify_checksum(&self, id: Id) -> Result<(), String> {
+        let (path, expected) = {
+            let st = self.state.lock();
+            match st.downloads.iter().find(|d| d.id == id) {
+                Some(d) => (d.path(), d.expected_hash.clone()),
+                None => return Ok(()),
+            }
+        };
+        let Some(expected) = expected else { return Ok(()) };
+        let result = tokio::task::spawn_blocking(move || crate::checksum::verify(&path, &expected))
+            .await
+            .unwrap_or_else(|e| Err(format!("checksum task failed: {e}")));
+        if let Some(d) = self.state.lock().downloads.iter_mut().find(|d| d.id == id) {
+            d.verified = Some(result.is_ok());
+        }
+        result
+    }
+
+    /// Download an HLS stream (`.m3u8`): read the playlist, then fetch and join its segments.
+    async fn run_hls(
+        self: Arc<Self>,
+        id: Id,
+        spec: RequestSpec,
+        client: Client,
+        limiter: Arc<RateLimiter>,
+        cfg: Config,
+        mut cancel_rx: watch::Receiver<bool>,
+    ) -> (Outcome, Option<Arc<Progress>>) {
+        let progress = Progress::new();
+        if let Some(live) = self.state.lock().live.get_mut(&id) {
+            live.progress = Some(progress.clone());
+        }
+        let stall = Duration::from_secs(cfg.stall_timeout_secs.max(5));
+        let plan = match hls::prepare(&client, &spec, stall, &mut cancel_rx).await {
+            Ok(plan) => plan,
+            Err(outcome) => return (outcome, Some(progress)),
+        };
+
+        let path = {
+            let mut st = self.state.lock();
+            let st = &mut *st;
+            let Some(pos) = st.downloads.iter().position(|d| d.id == id) else {
+                return (Outcome::Failed("download no longer exists".into()), Some(progress));
+            };
+            // "master.m3u8" is the playlist's name, not a name for the video.
+            let is_playlist_name = st.downloads[pos].file_name.to_ascii_lowercase().ends_with(".m3u8");
+            if !st.downloads[pos].name_final || is_playlist_name {
+                let name = format!("{}.{}", hls::stream_name(&spec.url), plan.extension());
+                let (mut cat, mut dir) = (st.downloads[pos].category.clone(), st.downloads[pos].dir.clone());
+                if st.downloads[pos].auto_place {
+                    (cat, dir) = place(&st.config, &name);
+                }
+                let unique = filename::unique_path(&dir, &name, |p| {
+                    st.downloads.iter().any(|o| o.id != id && o.status != Status::Complete && o.path() == p)
+                });
+                let d = &mut st.downloads[pos];
+                d.file_name = unique.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
+                d.category = cat;
+                d.dir = dir;
+                d.name_final = true;
+            }
+            let d = &mut st.downloads[pos];
+            d.resumable = Some(true);
+            if d.description.is_empty() {
+                if let Some(q) = &plan.quality {
+                    d.description = format!("Video stream {q}");
+                }
+            }
+            st.dirty = true;
+            d.path()
+        };
+        (self.notify)();
+
+        let hcfg = hls::HlsConfig {
+            spec,
+            final_path: path,
+            parallel: 6,
+            max_retries: cfg.max_retries,
+            timeout: stall,
+            limiter,
+            global_limiter: self.global_limiter.clone(),
+        };
+        (hls::run(client, hcfg, plan, progress.clone(), cancel_rx).await, Some(progress))
     }
 
     async fn run_download(
@@ -886,6 +1135,11 @@ impl Inner {
         let client = self.client.lock().clone();
         let stall = Duration::from_secs(cfg.stall_timeout_secs.max(5));
 
+        if hls::looks_like_hls(&spec.url, None) {
+            drop(probe);
+            return self.run_hls(id, spec, client, limiter, cfg, cancel_rx).await;
+        }
+
         // Resume if the data from an earlier run is there and belongs to this URL.
         let saved = ResumeState::load(&state_path(&path)).filter(|s| s.url == spec.url && part_path(&path).exists());
         let (start, path) = match saved {
@@ -901,6 +1155,11 @@ impl Inner {
                         }
                     }
                 };
+                if hls::looks_like_hls(&spec.url, probe.info.content_type.as_deref()) {
+                    // A playlist behind an address that does not end in .m3u8.
+                    drop(probe);
+                    return self.run_hls(id, spec, client, limiter, cfg, cancel_rx).await;
+                }
                 // The server may know a better name than the URL suggested.
                 let mut st = self.state.lock();
                 let st = &mut *st;
@@ -1047,18 +1306,17 @@ impl Inner {
         let now = Local::now();
         let today = now.date_naive();
         let weekday = now.weekday().num_days_from_monday() as usize;
-        let minute_now = (now.hour(), now.minute());
         let mut actions = Vec::new();
         {
             let mut st = self.state.lock();
             let st = &mut *st;
             for q in &st.queues {
-                let s = &q.schedule;
-                let day_ok = s.days.iter().all(|d| !d) || s.days[weekday];
-                if s.start_enabled && day_ok && minute_now == (s.start_hour, s.start_minute) && st.fired.insert((q.id, true), today) != Some(today) {
+                let (start, stop) = schedule_due(&q.schedule, weekday, now.hour(), now.minute());
+                // `fired` remembers the day so a one-minute match fires once, not sixty times.
+                if start && st.fired.insert((q.id, true), today) != Some(today) {
                     actions.push((q.id, true));
                 }
-                if s.stop_enabled && minute_now == (s.stop_hour, s.stop_minute) && st.fired.insert((q.id, false), today) != Some(today) {
+                if stop && st.fired.insert((q.id, false), today) != Some(today) {
                     actions.push((q.id, false));
                 }
             }
@@ -1125,6 +1383,44 @@ async fn housekeeping(weak: Weak<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedules_fire_on_the_right_minute_and_day() {
+        let mut s = Schedule { start_enabled: true, start_hour: 23, start_minute: 30, ..Default::default() };
+        // No day ticked means every day.
+        assert_eq!(schedule_due(&s, 2, 23, 30), (true, false));
+        assert_eq!(schedule_due(&s, 2, 23, 31), (false, false));
+        assert_eq!(schedule_due(&s, 2, 22, 30), (false, false));
+        // Only Saturday (5) and Sunday (6).
+        s.days = [false, false, false, false, false, true, true];
+        assert_eq!(schedule_due(&s, 4, 23, 30), (false, false));
+        assert_eq!(schedule_due(&s, 5, 23, 30), (true, false));
+        // The stop time applies on any day, and both can coincide.
+        s.stop_enabled = true;
+        (s.stop_hour, s.stop_minute) = (7, 0);
+        assert_eq!(schedule_due(&s, 1, 7, 0), (false, true));
+        (s.stop_hour, s.stop_minute) = (23, 30);
+        assert_eq!(schedule_due(&s, 6, 23, 30), (true, true));
+        // Disabled schedules never fire.
+        assert_eq!(schedule_due(&Schedule::default(), 0, 23, 0), (false, false));
+    }
+
+    #[test]
+    fn list_formats() {
+        let json = r#"[{"url":"https://h/a.zip","fileName":"A.zip","description":"x"},{"url":"ftp://h/b"}]"#;
+        let items = parse_list(json);
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].file_name.as_deref(), items[0].description.as_str()), (Some("A.zip"), "x"));
+
+        assert_eq!(parse_list(r#"["https://h/1", "nope", " http://h/2 "]"#).iter().map(|i| i.url.as_str()).collect::<Vec<_>>(), vec!["https://h/1", "http://h/2"]);
+
+        let text = "\u{feff}https://h/one.zip\r\n\r\n# comment\r\nnot a link\r\nhttp://h/two.zip  \r\nhttps://h/has space.zip\r\n";
+        assert_eq!(parse_list(text).iter().map(|i| i.url.as_str()).collect::<Vec<_>>(), vec!["https://h/one.zip", "http://h/two.zip"]);
+
+        let shortcut = "[InternetShortcut]\r\nURL=https://h/file.iso\r\nIconIndex=0\r\n";
+        assert_eq!(parse_list(shortcut).iter().map(|i| i.url.as_str()).collect::<Vec<_>>(), vec!["https://h/file.iso"]);
+        assert!(parse_list("").is_empty());
+    }
 
     #[test]
     fn host_patterns() {

@@ -17,3 +17,9 @@ arboard = "3.6.1"
 open = "5.4.4"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+tray-icon = "0.26.1"
+log = "0.4.34"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["eframe"] }
+rdm-core = { path = "../rdm-core", features = ["testserver"] }

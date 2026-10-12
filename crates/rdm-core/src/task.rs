@@ -58,6 +58,10 @@ pub struct TaskConfig {
     pub limiter: Arc<RateLimiter>,
     pub global_limiter: Arc<RateLimiter>,
     pub set_file_time: bool,
+    /// A connection must be this old before it can be judged slow…
+    pub evict_settle: Duration,
+    /// …and stay far below its peers for this many seconds to be replaced.
+    pub evict_after_secs: u32,
 }
 
 impl TaskConfig {
@@ -73,6 +77,8 @@ impl TaskConfig {
             limiter: Arc::new(RateLimiter::unlimited()),
             global_limiter: Arc::new(RateLimiter::unlimited()),
             set_file_time: true,
+            evict_settle: Duration::from_secs(5),
+            evict_after_secs: 10,
         }
     }
 }
@@ -93,14 +99,14 @@ pub enum Outcome {
 
 /// Live numbers, readable from any thread without touching the task.
 pub struct Progress {
-    size: AtomicU64,
-    downloaded: AtomicU64,
-    speed: AtomicU64,
-    connections: AtomicU32,
-    resumable: AtomicBool,
-    table: Mutex<Option<Arc<SegmentTable>>>,
-    info: Mutex<Option<http::RemoteInfo>>,
-    last_error: Mutex<Option<String>>,
+    pub(crate) size: AtomicU64,
+    pub(crate) downloaded: AtomicU64,
+    pub(crate) speed: AtomicU64,
+    pub(crate) connections: AtomicU32,
+    pub(crate) resumable: AtomicBool,
+    pub(crate) table: Mutex<Option<Arc<SegmentTable>>>,
+    pub(crate) info: Mutex<Option<http::RemoteInfo>>,
+    pub(crate) last_error: Mutex<Option<String>>,
 }
 
 impl Progress {
@@ -584,7 +590,7 @@ impl Task {
 
                     if now.duration_since(last_evict_check) >= Duration::from_secs(1) {
                         last_evict_check = now;
-                        evict_slow(&table);
+                        evict_slow(&table, cfg.evict_settle, cfg.evict_after_secs);
                     }
                 }
                 Some(joined) = workers.join_next(), if !workers.is_empty() => {
@@ -810,9 +816,9 @@ fn retryable_status(code: u16) -> bool {
 
 /// Kick connections that have crawled far below their peers for 10 s while
 /// still holding real work, so the segment is retried on a fresh connection.
-fn evict_slow(table: &SegmentTable) {
+fn evict_slow(table: &SegmentTable, settle: Duration, after_secs: u32) {
     let settled: Vec<Arc<Segment>> =
-        table.owned_segments().into_iter().filter(|s| s.owned_for() > Duration::from_secs(5)).collect();
+        table.owned_segments().into_iter().filter(|s| s.owned_for() > settle).collect();
     if settled.len() < 3 {
         return;
     }
@@ -824,7 +830,7 @@ fn evict_slow(table: &SegmentTable) {
     }
     for seg in settled {
         if seg.speed().saturating_mul(5) < median && seg.remaining() > 4 * 1024 * 1024 {
-            if seg.slow_secs.fetch_add(1, Ordering::Relaxed) + 1 >= 10 {
+            if seg.slow_secs.fetch_add(1, Ordering::Relaxed) + 1 >= after_secs {
                 seg.slow_secs.store(0, Ordering::Relaxed);
                 seg.kick.notify_waiters();
             }

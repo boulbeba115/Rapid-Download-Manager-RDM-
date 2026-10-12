@@ -84,3 +84,51 @@ mod tests {
         assert_eq!(eta_secs(None, 0, 100), None);
     }
 }
+
+/// `https://h/part*.zip`, 1..=3, 2 digits → `part01.zip`, `part02.zip`, `part03.zip`.
+/// Only the first `*` is replaced. At most `limit` addresses are produced.
+pub fn expand_template(template: &str, from: u32, to: u32, digits: usize, limit: usize) -> Vec<String> {
+    if !template.contains('*') || to < from {
+        return Vec::new();
+    }
+    (from..=to).take(limit).map(|n| template.replacen('*', &format!("{n:0digits$}"), 1)).collect()
+}
+
+/// If `text` is nothing but one http(s) link to a file whose extension is in
+/// `extensions`, return that link. Used for clipboard monitoring.
+pub fn download_link(text: &str, extensions: &[String]) -> Option<String> {
+    let url = text.trim();
+    if url.len() > 2048 || url.contains(char::is_whitespace) || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let ext = crate::filename::from_url(url).and_then(|n| crate::filename::extension(&n))?;
+    extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)).then(|| url.to_string())
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    #[test]
+    fn templates() {
+        assert_eq!(
+            expand_template("https://h/part*.zip", 9, 11, 3, 100),
+            vec!["https://h/part009.zip", "https://h/part010.zip", "https://h/part011.zip"]
+        );
+        assert_eq!(expand_template("https://h/a*b*.bin", 1, 1, 1, 100), vec!["https://h/a1b*.bin"]);
+        assert!(expand_template("https://h/none.zip", 1, 5, 2, 100).is_empty());
+        assert!(expand_template("https://h/x*.zip", 5, 1, 2, 100).is_empty());
+        assert_eq!(expand_template("https://h/x*.zip", 0, 99_999, 1, 50).len(), 50);
+    }
+
+    #[test]
+    fn clipboard_links() {
+        let exts: Vec<String> = ["zip", "mp4"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(download_link("  https://h.com/a/File.ZIP?x=1 \n", &exts).as_deref(), Some("https://h.com/a/File.ZIP?x=1"));
+        assert_eq!(download_link("https://h.com/page.html", &exts), None);
+        assert_eq!(download_link("https://h.com/", &exts), None);
+        assert_eq!(download_link("see https://h.com/a.zip", &exts), None, "prose is not a link");
+        assert_eq!(download_link("ftp://h.com/a.zip", &exts), None);
+        assert_eq!(download_link("C:/Users/me/a.zip", &exts), None);
+    }
+}
