@@ -78,18 +78,45 @@ if (-not $SkipBrowser) {
         $prefs = @{ download = @{ default_directory = $downloads; prompt_for_download = $false } } | ConvertTo-Json -Depth 4
         [IO.File]::WriteAllText((Join-Path $profile "Default\Preferences"), $prefs, (New-Object Text.UTF8Encoding($false)))
 
-        $common = @(
+        $debugPort = 9333
+        $flags = @(
             "--user-data-dir=$profile", "--no-first-run", "--no-default-browser-check", "--disable-sync",
             "--disable-features=DisableLoadExtensionCommandLineSwitch",
-            "--load-extension=$(Join-Path $root 'extension')"
+            "--load-extension=$(Join-Path $root 'extension')",
+            "--remote-debugging-port=$debugPort", "about:blank"
         )
-        # First start loads the extension; the download is requested once its worker is up.
-        Start-Process $edge -ArgumentList ($common + "about:blank") | Out-Null
-        Start-Sleep -Seconds 7
-        Start-Process $edge -ArgumentList ($common + "http://127.0.0.1:18081/from-browser.bin") | Out-Null
+        Start-Process $edge -ArgumentList $flags | Out-Null
+
+        # Wait until the extension's service worker is up.
+        $worker = $null
+        $deadline = (Get-Date).AddSeconds(25)
+        while (-not $worker -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            try {
+                $worker = (Invoke-RestMethod "http://127.0.0.1:$debugPort/json/list" -TimeoutSec 3) |
+                    Where-Object { $_.url -like "chrome-extension://*/background.js" } | Select-Object -First 1
+            } catch { }
+        }
+        Check "Edge loaded the extension" ($null -ne $worker)
+
+        # Start a download through the browser's own download system (a bare
+        # tab opened over the debugging port does not create one), using the
+        # DevTools protocol. From here on it is the same path as a clicked
+        # link: downloads.onCreated -> the extension -> RDM.
+        if ($worker) {
+            Start-Sleep -Seconds 1
+            $expr = "chrome.downloads.download({ url: 'http://127.0.0.1:18081/from-browser.bin' })"
+            $msg = @{ id = 1; method = "Runtime.evaluate"; params = @{ expression = $expr; awaitPromise = $true } } | ConvertTo-Json -Depth 5 -Compress
+            $ws = New-Object System.Net.WebSockets.ClientWebSocket
+            $none = [Threading.CancellationToken]::None
+            $ws.ConnectAsync([uri]$worker.webSocketDebuggerUrl, $none).Wait(10000) | Out-Null
+            $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
+            $ws.SendAsync((New-Object ArraySegment[byte] -ArgumentList @(, $bytes)), "Text", $true, $none).Wait(10000) | Out-Null
+        }
 
         $taken = Wait-Log "add request from the browser extension: http://127.0.0.1:18081/from-browser.bin" 25
         Check "the extension hands the download to RDM" $taken
+        if ($ws) { $ws.Dispose() }
         Start-Sleep -Seconds 2
         $kept = @(Get-ChildItem $downloads -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "from-browser*" -and $_.Extension -ne ".crdownload" })
         Check "the browser's own copy was cancelled" $kept.Count 0
@@ -103,6 +130,15 @@ if (-not $SkipBrowser) {
 Start-Process $exe -ArgumentList "/quit" -Wait
 Check "application quits" ($app.WaitForExit(10000))
 if (-not $app.HasExited) { $app.Kill() }
+
+Write-Host "Unattended download (/n /q)"
+$qdir = Join-Path $work "unattended"
+$q = Start-Process $exe -ArgumentList "/n", "/q", "/d", "http://127.0.0.1:18081/quit-when-done.bin", "/p", $qdir -PassThru
+Check "downloads without asking and exits by itself" ($q.WaitForExit(40000))
+if (-not $q.HasExited) { $q.Kill() }
+$qfile = Join-Path $qdir "quit-when-done.bin"
+Check "the file was saved where /p said" (Test-Path $qfile)
+if (Test-Path $qfile) { Check "and is complete" (Get-Item $qfile).Length (5 * 1024 * 1024) }
 if (-not $server.HasExited) { $server.Kill() }
 
 Write-Host "--- rdm.log ---"

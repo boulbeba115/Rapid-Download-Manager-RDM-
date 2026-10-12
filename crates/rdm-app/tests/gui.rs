@@ -288,3 +288,48 @@ fn batch_dialog_adds_a_numbered_series() {
 fn present(h: &Harness<'static, RdmApp>, label: &str) -> bool {
     h.query_all_by_label(label).next().is_some()
 }
+
+/// A download handed over by the browser or the clipboard must wait in the
+/// Download File Info dialog until the user decides — never start by itself.
+#[test]
+fn captured_download_waits_for_the_user() {
+    let mut gui = Gui::new("capture");
+    let server = gui.server(ServerOptions::new(MIB));
+
+    let request = rdm_core::manager::AddRequest { url: server.url(), ..Default::default() };
+    gui.app().manager().push_event(rdm_core::manager::Event::AddRequest(request));
+    gui.until("Download File Info", 10, |h| present(h, "Start Download"));
+
+    // Leave it alone for a while, as a user who is busy elsewhere would.
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        gui.h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(gui.app().manager().views().is_empty(), "the download was added without anyone confirming it");
+    assert!(gui.has("Start Download"), "the dialog should still be waiting");
+
+    // Cancel discards it.
+    gui.click("Cancel");
+    gui.until("the dialog to close", 5, |h| !present(h, "Start Download"));
+    assert!(gui.app().manager().views().is_empty());
+}
+
+/// Ctrl+V with a link on the clipboard opens the Download File Info dialog for it.
+#[test]
+fn pasting_a_link_opens_the_add_dialog() {
+    let mut gui = Gui::new("paste");
+    let server = gui.server(ServerOptions::new(MIB));
+
+    // Text that is not a link is ignored.
+    gui.h.event(egui::Event::Paste("just some words".into()));
+    gui.steps(5);
+    assert!(!gui.has("Getting file information…") && !gui.has("Start Download"));
+
+    gui.h.event(egui::Event::Paste(format!("  {}\n", server.url())));
+    gui.until("Download File Info", 10, |h| present(h, "Start Download"));
+    gui.click("Download Later");
+    gui.until("the download to be queued", 5, |h| h.state().manager().views().len() == 1);
+    let v = gui.app().manager().views().remove(0);
+    assert_eq!((v.d.status, v.d.queue), (Status::Queued, Some(MAIN_QUEUE)));
+}

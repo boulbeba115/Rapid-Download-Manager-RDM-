@@ -447,25 +447,46 @@ anything not listed as verified has been written but not exercised._
 |---|---|
 | M1 Engine | **Done** |
 | M2 GUI core | **Done** |
-| M3 Management | **Mostly done** — checksum verification missing |
-| M4 Integration | **Partly done** — tray, drag & drop, import/export missing; extension untested in a browser |
-| M5 Media & grabber | Not started |
-| M6 Packaging | Not started |
+| M3 Management | **Done** |
+| M4 Integration | **Done** |
+| M5 Media & grabber | **Partly done** — HLS and a single-page link grabber; no DASH, no FTP, no multi-level grabbing |
+| M6 Packaging | **Done** except code signing |
+
+### Verification suites
+| Suite | What it is | Size |
+|---|---|---|
+| `cargo test --workspace` | Unit tests, engine tests against the fault-injecting server, manager tests, HLS tests, click-through GUI tests | 82 tests |
+| `scripts/test-installer.ps1` | Silent install into a temp folder, run, uninstall | 34 checks |
+| `scripts/test-integration.ps1` | Clipboard monitoring, the extension in a real Edge, unattended `/n /q` | 10 checks |
 
 ### Done and verified
 | Item | How it was verified |
 |---|---|
-| Probe reuse, dynamic segmentation, work stealing, 1–32 connections | 19 integration tests against the fault-injecting server; every output compared byte-for-byte |
-| Pause / resume, crash / resume from checkpoint | Tests; plus a real process killed mid-download from a public server, resumed, SHA-256 identical to a `curl` copy |
-| Retry with back-off, dropped connections, no-range and no-length servers, changed-file detection | Tests |
-| Server connection caps, `429` rate limiting, `Retry-After`, segment absorption | Tests; plus two public hosts that rate-limit |
+| Probe reuse, dynamic segmentation, work stealing, 1–32 connections | Engine tests; every output compared byte-for-byte |
+| Pause / resume, crash / resume from checkpoint | Engine tests; plus a real process killed mid-download from a public server, resumed, SHA-256 identical to a `curl` copy |
+| Retry with back-off, dropped connections, no-range and no-length servers, changed-file detection | Engine tests |
+| Server connection caps, `429` rate limiting, `Retry-After`, segment absorption | Engine tests; plus two public hosts that rate-limit |
+| Slow-connection eviction | Test: one of four connections throttled to 8 KB/s is replaced; download takes 7 s instead of minutes |
 | Speed limiter | Test: 4 MiB at 1 MiB/s took 4 s ± 5 % |
 | Auto connection count | Test and benchmark |
-| File naming (Content-Disposition, path-traversal stripping), categories, unique names | Unit and manager tests |
-| List persistence, restart of the app mid-download | Manager tests |
+| Authenticating HTTP proxy | Test: every connection passes through a local proxy; a wrong password is reported as 407 |
+| Site logins, per-site connection limits | Manager tests |
+| Checksum verification (MD5 / SHA-1 / SHA-256) | Unit and manager tests (match, mismatch) |
+| HLS streams: master playlist, best rendition, AES-128 (explicit and sequence IV), pause/resume, live refused | HLS tests against a playlist server |
+| Link grabber | Unit tests on extraction; manager test against a served page |
+| Import / export (JSON, text, `.url` shortcuts) | Unit and manager tests |
+| Scheduler | Unit tests on the rule; a manager test where the queue starts itself at the scheduled minute |
 | Queues, N files at a time, on-finish action event | Manager test |
-| Loopback API access rules, single-instance forwarding, `/d /p /f /n /a /s` | 13 end-to-end checks against the release build |
-| Main window, Add URL → Download File Info, progress window with segment map, Options, Scheduler | Rendered from the real app with live downloads and inspected |
+| Changing a download's address keeps progress | Manager test |
+| File naming, categories, unique names, list persistence, restart mid-download | Unit and manager tests |
+| Add URL → Download File Info → start → complete → delete; stop / resume; search, sort, category filter, context menu; scheduler dialog; options saved; batch; paste a link; captured downloads wait for confirmation | GUI tests that click the real interface (`egui_kittest`) |
+| Loopback API access rules, single-instance forwarding, `/d /p /f /n /a /s` | End-to-end checks against the release build |
+| `/n /q` unattended download that exits when done | Integration script |
+| Clipboard monitoring | Integration script: ordinary text and page links ignored, a file link picked up |
+| Browser extension | Integration script: loaded into Microsoft Edge; a download created by the browser is handed to RDM and the browser's copy cancelled |
+| Installer / uninstaller | Installer script: files, Apps & features entry, shortcuts, closing a running instance, clean removal |
+| Tray: start hidden, restore, quit while hidden | Installer script (window visibility checked through Win32) |
+| Icon and version information in the executables | Read back through Windows (`VersionInfo`, associated icon) |
 
 ### Measured (this machine, release build)
 | Metric | Target | Measured |
@@ -477,31 +498,35 @@ anything not listed as verified has been written but not exercised._
 | Engine CPU and memory under load | < 1 core, < 40 MiB | **not measured** |
 | Head-to-head against IDM | parity | **not measured** — needs IDM on the same link and server |
 
-### Written but not exercised end to end
-- Button-level GUI interaction (clicks, context menu, multi-select, sorting):
-  the code paths behind them are tested through the manager, the screens were
-  rendered and inspected, but nobody has clicked through them yet.
-- Browser extension (`extension/`): written against the tested API; not yet
-  loaded into Chrome/Edge. Firefox needs a manifest tweak.
-- Scheduler start/stop times, power actions (sleep/hibernate/shut down with a
-  60 s cancellable countdown), clipboard monitoring, batch download, changing a
-  download's address, proxy settings, site logins, per-site connection limits,
-  slow-connection eviction.
+### Written but not exercised
+- Tray **menu items** and clicking the tray icon (the hide / restore / quit
+  paths they call are tested; the icon itself has not been clicked by a test).
+- Dropping files on the window (the import it calls is tested).
+- Power actions after a queue (sleep / hibernate / shut down with a 60 s
+  cancellable countdown) — deliberately not triggered on a development machine.
+- SOCKS5 and HTTPS proxies (the HTTP proxy path is tested).
+- The extension in Chrome (Chrome no longer loads unpacked extensions from the
+  command line, so only Edge could be automated) and in Firefox (needs a
+  manifest tweak).
+- A real link click in the browser: the integration test starts the download
+  through the browser's download API, which is the same path from
+  `downloads.onCreated` onward.
+- "Start with Windows" (the installer writes the `Run` entry; signing in again
+  to see it start was not tested).
 
-### Not implemented yet
-- §5.10 checksum verification.
-- §8.6 tray icon / close-to-tray; drag & drop of links.
-- §8.7 import / export of the list.
-- §10 `/q` (exit when done).
-- §11 HLS/DASH video capture, site grabber, FTP.
-- §11.4 installer, embedded executable icon and version info, start with
-  Windows, code signing.
-- §5.4 remembering a learned per-host connection ceiling across downloads
-  (per-site limits are manual for now).
+### Not implemented
+- FTP / FTPS.
+- DASH (`.mpd`) streams; a "download this video" panel in the browser.
+- Multi-level site grabbing (the grabber reads one page).
+- Code signing (Windows SmartScreen warns on first run).
+- Remembering a learned per-host connection ceiling across sessions
+  (per-site limits are set by hand).
+- `/h` (hang up a modem connection) — obsolete, ignored.
 
 ### Known limitations
 - Hosts that punish parallel connections (lower total speed with 2 than with 1)
   are handled correctly but not optimally; pin them to 1 connection in Options.
 - Site-login and proxy passwords are stored unencrypted in `config.json`.
 - The build targets `x86_64-pc-windows-gnu` and needs the linker setup in
-  `README.md`.
+  `README.md`; for the same reason the executable icon is stamped in after
+  linking by `crates/xtask`.

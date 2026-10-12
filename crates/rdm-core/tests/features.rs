@@ -310,3 +310,63 @@ async fn crawling_connection_is_replaced() {
     assert!(server.stats.connections.load(Ordering::Relaxed) > 4, "a replacement connection should have been opened");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Serve one fixed HTML page on every path.
+async fn serve_page(html: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { break };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", html.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(html.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/gallery/index.html")
+}
+
+#[test]
+fn link_grabber_lists_the_files_on_a_page() {
+    let fx = Fixture::new("grab");
+    let page = r#"<html><body>
+        <a href="files/setup.exe">Installer</a>
+        <a href="/docs/manual.pdf">Manual</a>
+        <a href="about.html">About</a>
+        <img src="logo.png">
+        <a href="https://cdn.example.org/media/trailer.mp4?sig=abc">Trailer</a>
+    </body></html>"#;
+    let url = fx.manager.runtime().block_on(serve_page(page));
+
+    let wait = |ticket: rdm_core::manager::GrabTicket| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(result) = ticket.result() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "the grabber never answered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let wanted = vec!["exe".to_string(), "pdf".to_string(), "mp4".to_string()];
+    let links = wait(fx.manager.grab(RequestSpec::new(url.clone()), wanted)).unwrap();
+    let names: Vec<&str> = links.iter().map(|l| l.file_name.as_str()).collect();
+    assert_eq!(names, vec!["setup.exe", "manual.pdf", "trailer.mp4"]);
+    let base = url.trim_end_matches("/gallery/index.html");
+    assert_eq!(links[0].url, format!("{base}/gallery/files/setup.exe"));
+    assert_eq!(links[1].url, format!("{base}/docs/manual.pdf"));
+    assert_eq!(links[2].url, "https://cdn.example.org/media/trailer.mp4?sig=abc");
+
+    // No filter: every linked file, pages without an extension excluded.
+    let all = wait(fx.manager.grab(RequestSpec::new(url), Vec::new())).unwrap();
+    assert_eq!(all.len(), 5);
+
+    // A dead address reports an error instead of hanging.
+    let err = wait(fx.manager.grab(RequestSpec::new("http://127.0.0.1:9/nothing"), Vec::new())).unwrap_err();
+    assert!(!err.is_empty());
+}

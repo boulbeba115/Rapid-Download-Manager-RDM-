@@ -303,6 +303,11 @@ impl AddDialog {
                         if ui.add_sized([90.0, 26.0], egui::Button::new("Cancel")).clicked() {
                             outcome = AddOutcome::Close;
                         }
+                        if now || later {
+                            // Record how the choice was made: a download must never start without the user.
+                            let by = ui.input(|i| if i.pointer.primary_released() { "mouse click" } else { "keyboard" });
+                            log::info!("{} confirmed by {by}: {}", if now { "start" } else { "download later" }, self.url.trim());
+                        }
                         if now {
                             outcome = self.submit(manager, true);
                         } else if later {
