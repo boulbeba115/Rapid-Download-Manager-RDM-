@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Layout, RichText};
@@ -10,9 +12,10 @@ use rdm_core::manager::{AddRequest, Event, PostAction, MAIN_QUEUE};
 use rdm_core::util::{eta_secs, format_duration, format_size, format_speed};
 use rdm_core::{Config, Id, Manager, NewDownload, Queue, RequestSpec, Status, View};
 
-use crate::dialogs::{AddDialog, AddOutcome, BatchDialog, DeleteDialog, OptionsDialog, PowerCountdown, PropertiesDialog, SchedulerDialog};
+use crate::dialogs::{AddDialog, AddOutcome, BatchDialog, DeleteDialog, GrabDialog, OptionsDialog, PowerCountdown, PropertiesDialog, SchedulerDialog};
 use crate::progress::{reveal_in_folder, CompleteDialog, ProgressWindow};
 use crate::theme::{self, category_color, GREEN, ORANGE, RED};
+use crate::tray::{Tray, TrayAction};
 use crate::widgets::{file_badge, mini_progress, tool_button, Icon};
 
 /// Launch options that belong to this process (not forwarded to a running instance).
@@ -23,6 +26,10 @@ pub struct Launch {
     pub screenshot: Option<PathBuf>,
     /// With `screenshot`: which dialog to have open (`add`, `options`, `scheduler`, `progress`).
     pub show: Option<String>,
+    /// Start hidden in the notification area.
+    pub minimized: bool,
+    /// No tray icon, no clipboard access, child windows embedded (automated tests).
+    pub headless: bool,
     /// IDM-style arguments (`/d URL` …) to act on.
     pub args: Vec<String>,
 }
@@ -53,6 +60,7 @@ pub struct RdmApp {
     queues: Vec<Queue>,
     views: Vec<View>,
     refreshed: Instant,
+    stale: Arc<AtomicBool>,
 
     filter: Filter,
     search: String,
@@ -66,6 +74,7 @@ pub struct RdmApp {
     delete: Option<DeleteDialog>,
     properties: Option<PropertiesDialog>,
     batch: Option<BatchDialog>,
+    grab: Option<GrabDialog>,
     about: bool,
     power: Option<PowerCountdown>,
     progress: BTreeMap<Id, ProgressWindow>,
@@ -74,6 +83,14 @@ pub struct RdmApp {
     clipboard: Option<arboard::Clipboard>,
     clipboard_seen: String,
     clipboard_checked: Instant,
+
+    tray: Option<Tray>,
+    /// The window is hidden in the notification area.
+    hidden: bool,
+    /// Downloads started with `/q`: exit once they have all finished.
+    quit_after: BTreeSet<Id>,
+    /// Short message shown in the status bar for a few seconds.
+    notice: Option<(String, Instant)>,
 
     api_status: String,
     launch: Launch,
@@ -89,7 +106,14 @@ fn percent(v: &View) -> Option<f32> {
 impl RdmApp {
     pub fn new(cc: &eframe::CreationContext<'_>, data_dir: PathBuf, launch: Launch) -> Result<Self, String> {
         let ctx = cc.egui_ctx.clone();
-        let manager = Manager::new(data_dir, move || ctx.request_repaint()).map_err(|e| e.to_string())?;
+        // Set by the engine whenever something changed, so the list is re-read on the next frame.
+        let stale = Arc::new(AtomicBool::new(true));
+        let flag = stale.clone();
+        let manager = Manager::new(data_dir, move || {
+            flag.store(true, Ordering::Relaxed);
+            ctx.request_repaint();
+        })
+        .map_err(|e| e.to_string())?;
         let config = manager.config();
         theme::apply(&cc.egui_ctx, config.dark_mode);
 
@@ -102,9 +126,16 @@ impl RdmApp {
                 manager.push_event(event);
             }
         }
-        if launch.screenshot.is_some() {
-            // One image must contain the child windows too.
+        if launch.screenshot.is_some() || launch.headless {
+            // One image (or one test surface) must contain the child windows too.
             cc.egui_ctx.set_embed_viewports(true);
+        }
+
+        let tray = if launch.screenshot.is_some() || launch.headless { None } else { Tray::new(&cc.egui_ctx) };
+        // Starting hidden only makes sense if there is an icon to bring the window back.
+        let hidden = launch.minimized && tray.is_some();
+        if launch.minimized && !hidden {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
 
         let mut app = Self {
@@ -113,6 +144,7 @@ impl RdmApp {
             config,
             manager,
             refreshed: Instant::now(),
+            stale,
             filter: Filter::All,
             search: String::new(),
             selected: BTreeSet::new(),
@@ -124,13 +156,18 @@ impl RdmApp {
             delete: None,
             properties: None,
             batch: None,
+            grab: None,
             about: false,
             power: None,
             progress: BTreeMap::new(),
             completed: Vec::new(),
-            clipboard: arboard::Clipboard::new().ok(),
+            clipboard: if launch.headless { None } else { arboard::Clipboard::new().ok() },
             clipboard_seen: String::new(),
             clipboard_checked: Instant::now(),
+            tray,
+            hidden,
+            quit_after: BTreeSet::new(),
+            notice: None,
             api_status,
             launch,
             started: Instant::now(),
@@ -140,6 +177,102 @@ impl RdmApp {
         // Whatever is on the clipboard at start-up is old news.
         app.clipboard_seen = app.clipboard.as_mut().and_then(|c| c.get_text().ok()).unwrap_or_default();
         Ok(app)
+    }
+
+    pub fn manager(&self) -> &Manager {
+        &self.manager
+    }
+
+    fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), Instant::now()));
+    }
+
+    /// Bring the window back from the notification area / taskbar.
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+    }
+
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        for action in actions {
+            match action {
+                TrayAction::Show => self.show_window(ctx),
+                TrayAction::AddUrl => {
+                    self.show_window(ctx);
+                    self.open_add();
+                }
+                TrayAction::StartQueue => self.manager.start_queue(MAIN_QUEUE),
+                TrayAction::StopAll => self.manager.pause_all(),
+                TrayAction::Exit => self.quit = true,
+            }
+        }
+    }
+
+    /// The window's close button: keep running in the tray if configured.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) || self.quit {
+            return;
+        }
+        if self.tray.is_some() && self.config.close_to_tray {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hidden = true;
+        }
+    }
+
+    /// Files dropped on the window (link lists, `.url` shortcuts) and links
+    /// pasted with Ctrl+V while no text field has the focus.
+    fn handle_drop_and_paste(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        for path in dropped {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match self.manager.import_list(&path) {
+                Ok(0) => self.notify(format!("No new download links found in {name}")),
+                Ok(n) => self.notify(format!("Added {n} download(s) from {name}")),
+                Err(e) => self.notify(format!("Cannot read {name}: {e}")),
+            }
+            self.refresh();
+        }
+        if self.add.is_some() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let pasted = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(text) => Some(text.trim().to_string()),
+                _ => None,
+            })
+        });
+        if let Some(url) = pasted.filter(|u| (u.starts_with("http://") || u.starts_with("https://")) && !u.contains(char::is_whitespace)) {
+            self.add = Some(AddDialog::from_request(AddRequest { url, ..Default::default() }, &self.manager));
+        }
+    }
+
+    fn import_dialog(&mut self) {
+        let picked = rfd::FileDialog::new().add_filter("Link lists", &["json", "txt", "url"]).add_filter("All files", &["*"]).pick_file();
+        if let Some(path) = picked {
+            match self.manager.import_list(&path) {
+                Ok(n) => self.notify(format!("Imported {n} download(s)")),
+                Err(e) => self.notify(format!("Import failed: {e}")),
+            }
+            self.refresh();
+        }
+    }
+
+    fn export_dialog(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("RDM list (JSON)", &["json"])
+            .add_filter("Addresses only (text)", &["txt"])
+            .set_file_name("rdm-downloads.json")
+            .save_file();
+        if let Some(path) = picked {
+            match self.manager.export_list(&path) {
+                Ok(n) => self.notify(format!("Exported {n} download(s) to {}", path.display())),
+                Err(e) => self.notify(format!("Export failed: {e}")),
+            }
+        }
     }
 
     fn refresh(&mut self) {
@@ -216,6 +349,17 @@ impl RdmApp {
                     if ok && announce {
                         self.completed.push(CompleteDialog { id });
                     }
+                    if let Some(v) = self.manager.view(id) {
+                        match &v.d.error {
+                            Some(e) if !ok => log::warn!("{}: {e}", v.d.file_name),
+                            _ if ok => log::info!("finished {}", v.d.file_name),
+                            _ => {}
+                        }
+                    }
+                    // `/q`: leave once everything started that way is done.
+                    if self.quit_after.remove(&id) && self.quit_after.is_empty() && ok {
+                        self.quit = true;
+                    }
                 }
                 Event::AddRequest(req) => self.handle_add_request(req, ctx),
                 Event::StartQueue(id) => self.manager.start_queue(id),
@@ -224,7 +368,7 @@ impl RdmApp {
                     PostAction::ExitApp => self.quit = true,
                     action => self.power = Some(PowerCountdown { action, deadline: Instant::now() + Duration::from_secs(60) }),
                 },
-                Event::ShowWindow => bring_to_front(ctx),
+                Event::ShowWindow => self.show_window(ctx),
                 Event::Quit => self.quit = true,
             }
         }
@@ -244,14 +388,17 @@ impl RdmApp {
             new.dir = req.dir;
             new.start = !req.queue_only;
             new.queue = req.queue_only.then_some(MAIN_QUEUE);
-            self.manager.add(new);
+            let id = self.manager.add(new);
+            if req.quit_when_done && !req.queue_only {
+                self.quit_after.insert(id);
+            }
         } else {
             self.add = Some(AddDialog::from_request(req, &self.manager));
-            bring_to_front(ctx);
+            self.show_window(ctx);
         }
     }
 
-    fn watch_clipboard(&mut self) {
+    fn watch_clipboard(&mut self, ctx: &egui::Context) {
         if !self.config.monitor_clipboard || self.clipboard_checked.elapsed() < Duration::from_millis(800) {
             return;
         }
@@ -261,15 +408,11 @@ impl RdmApp {
             return;
         }
         self.clipboard_seen = text.clone();
-        let url = text.trim();
-        if url.len() > 2048 || url.contains(char::is_whitespace) || !(url.starts_with("http://") || url.starts_with("https://")) {
-            return;
-        }
-        let wanted = rdm_core::filename::from_url(url)
-            .and_then(|n| rdm_core::filename::extension(&n))
-            .is_some_and(|ext| self.config.capture_extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)));
-        if wanted && self.add.is_none() {
-            self.add = Some(AddDialog::from_request(AddRequest { url: url.to_string(), ..Default::default() }, &self.manager));
+        let Some(url) = rdm_core::util::download_link(&text, &self.config.capture_extensions) else { return };
+        if self.add.is_none() {
+            log::info!("download link on the clipboard: {url}");
+            self.add = Some(AddDialog::from_request(AddRequest { url, ..Default::default() }, &self.manager));
+            self.show_window(ctx);
         }
     }
 
@@ -285,6 +428,19 @@ impl RdmApp {
                 if ui.button("Add batch download…").clicked() {
                     self.batch = Some(BatchDialog::new());
                     ui.close();
+                }
+                if ui.button("Grab links from a page…").clicked() {
+                    self.grab = Some(GrabDialog::new(&self.config));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Import list…").clicked() {
+                    ui.close();
+                    self.import_dialog();
+                }
+                if ui.button("Export list…").clicked() {
+                    ui.close();
+                    self.export_dialog();
                 }
                 ui.separator();
                 if ui.button("Exit").clicked() {
@@ -470,6 +626,14 @@ impl RdmApp {
             if !self.selected.is_empty() {
                 ui.separator();
                 ui.label(format!("{} selected", self.selected.len()));
+            }
+            if let Some((text, since)) = &self.notice {
+                if since.elapsed() < Duration::from_secs(6) {
+                    ui.separator();
+                    ui.label(RichText::new(text).strong());
+                } else {
+                    self.notice = None;
+                }
             }
         });
     }
@@ -771,13 +935,23 @@ impl RdmApp {
             match d.show(ctx, &self.manager, &self.config) {
                 AddOutcome::Keep => self.add = Some(d),
                 AddOutcome::Close => {}
-                AddOutcome::Added { id, started } => {
+                AddOutcome::Added { id, started, quit_when_done } => {
                     self.refresh();
                     self.selected = BTreeSet::from([id]);
                     if started && self.config.show_progress_window {
                         self.open_progress(id);
                     }
+                    if started && quit_when_done {
+                        self.quit_after.insert(id);
+                    }
                 }
+            }
+        }
+        if let Some(mut d) = self.grab.take() {
+            if d.show(ctx, &self.manager) {
+                self.grab = Some(d);
+            } else {
+                self.refresh();
             }
         }
         if let Some(mut d) = self.delete.take() {
@@ -935,22 +1109,25 @@ fn menu_item(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
     clicked
 }
 
-fn bring_to_front(ctx: &egui::Context) {
-    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
-    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
-}
-
 impl eframe::App for RdmApp {
+    /// Runs every frame, and also while the window is hidden in the tray —
+    /// so everything that must work without a visible window lives here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_tray(ctx);
         self.handle_events(ctx);
-        self.watch_clipboard();
+        self.watch_clipboard(ctx);
+        self.handle_close_request(ctx);
 
         let active = self.views.iter().any(|v| v.d.status == Status::Running);
-        if self.refreshed.elapsed() >= Duration::from_millis(if active { 100 } else { 500 }) {
+        if self.stale.swap(false, Ordering::Relaxed) || self.refreshed.elapsed() >= Duration::from_millis(if active { 100 } else { 500 }) {
             self.refresh();
         }
+        if self.quit {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+        }
         // Idle: wake only often enough to notice queue/schedule changes and the clipboard.
-        ctx.request_repaint_after(Duration::from_millis(if active { 100 } else { 1000 }));
+        let idle = if self.hidden { 1500 } else { 1000 };
+        ctx.request_repaint_after(Duration::from_millis(if active && !self.hidden { 100 } else { idle }));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -961,16 +1138,13 @@ impl eframe::App for RdmApp {
         egui::Panel::left("categories").resizable(true).default_size(185.0).min_size(120.0).show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::default().show(ui, |ui| self.table(ui));
 
+        self.handle_drop_and_paste(&ctx);
         self.dialogs(&ctx);
         self.screenshot_mode(&ctx);
 
         // Delete key removes the selection (unless a text field has focus).
         if !self.selected.is_empty() && self.delete.is_none() && !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             self.ask_delete(self.selected.iter().copied().collect());
-        }
-
-        if self.quit {
-            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
         }
     }
 

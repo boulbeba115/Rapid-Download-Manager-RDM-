@@ -173,6 +173,8 @@ pub fn parse_cli(args: &[String]) -> Vec<Event> {
             }
             Some("s") => events.push(Event::StartQueue(MAIN_QUEUE)),
             Some("q") => add.quit_when_done = true,
+            // Ask the running instance to exit (used by the installer before replacing files).
+            Some("quit") => events.push(Event::Quit),
             // `/h` (hang up the modem) has no equivalent.
             Some(_) => {}
             None if is_http_url(arg) && add.url.is_empty() => add.url = arg.clone(),

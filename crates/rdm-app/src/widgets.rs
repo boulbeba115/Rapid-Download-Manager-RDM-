@@ -27,6 +27,8 @@ pub fn tool_button(ui: &mut Ui, icon: Icon, caption: &str, enabled: bool) -> boo
     let text_w = ui.painter().layout_no_wrap(caption.to_string(), font.clone(), Color32::WHITE).size().x;
     let size = vec2((text_w + 14.0).max(52.0), 54.0);
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    // Painted by hand, so say what it is: screen readers and UI tests rely on this.
+    resp.widget_info(|| eframe::egui::WidgetInfo::labeled(eframe::egui::WidgetType::Button, enabled, caption));
     if !ui.is_rect_visible(rect) {
         return false;
     }

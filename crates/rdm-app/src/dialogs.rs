@@ -32,7 +32,7 @@ enum Stage {
 pub enum AddOutcome {
     Keep,
     Close,
-    Added { id: Id, started: bool },
+    Added { id: Id, started: bool, quit_when_done: bool },
 }
 
 pub struct AddDialog {
@@ -49,6 +49,9 @@ pub struct AddDialog {
     save_as: String,
     description: String,
     first_frame: bool,
+    checksum: String,
+    /// The address is an HLS playlist rather than a file.
+    is_stream: bool,
 }
 
 impl AddDialog {
@@ -66,6 +69,8 @@ impl AddDialog {
             save_as: String::new(),
             description: String::new(),
             first_frame: true,
+            checksum: String::new(),
+            is_stream: false,
         }
     }
 
@@ -113,10 +118,12 @@ impl AddDialog {
         new.dir = path.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf);
         new.category = (!self.category.is_empty()).then(|| self.category.clone());
         new.description = self.description.clone();
+        new.expected_hash = Some(self.checksum.trim().to_string()).filter(|c| !c.is_empty());
         new.start = start;
         new.queue = (!start).then_some(MAIN_QUEUE);
-        new.probe = if start { self.ticket.as_ref().and_then(|t| t.take()) } else { None };
-        AddOutcome::Added { id: manager.add(new), started: start }
+        // A stream's first response is its playlist, not file data worth reusing.
+        new.probe = if start && !self.is_stream { self.ticket.as_ref().and_then(|t| t.take()) } else { None };
+        AddOutcome::Added { id: manager.add(new), started: start, quit_when_done: self.request.quit_when_done }
     }
 
     pub fn show(&mut self, ctx: &egui::Context, manager: &Manager, config: &Config) -> AddOutcome {
@@ -124,7 +131,13 @@ impl AddDialog {
         if matches!(self.stage, Stage::Probing) {
             match self.ticket.as_ref().and_then(|t| t.result()) {
                 Some(Ok(info)) => {
-                    let name = self.request.file_name.clone().unwrap_or_else(|| info.file_name.clone());
+                    self.is_stream = rdm_core::hls::looks_like_hls(self.url.trim(), info.content_type.as_deref());
+                    let name = if self.is_stream {
+                        // Name the video, not the playlist ("master.m3u8").
+                        format!("{}.ts", rdm_core::hls::stream_name(self.url.trim()))
+                    } else {
+                        self.request.file_name.clone().unwrap_or_else(|| info.file_name.clone())
+                    };
                     self.place(manager, &name);
                     self.info = Some(info);
                     self.stage = Stage::Info;
@@ -209,7 +222,7 @@ impl AddDialog {
                         new.dir = self.request.dir.clone();
                         new.start = false;
                         new.queue = Some(MAIN_QUEUE);
-                        outcome = AddOutcome::Added { id: manager.add(new), started: false };
+                        outcome = AddOutcome::Added { id: manager.add(new), started: false, quit_when_done: false };
                     }
                 }
                 Stage::Info => {
@@ -249,6 +262,10 @@ impl AddDialog {
                         ui.label("Description");
                         ui.add(egui::TextEdit::singleline(&mut self.description).desired_width(400.0));
                         ui.end_row();
+
+                        ui.label("Checksum");
+                        ui.add(egui::TextEdit::singleline(&mut self.checksum).desired_width(400.0).hint_text("optional — MD5, SHA-1 or SHA-256 to verify the file"));
+                        ui.end_row();
                     });
                     if category_changed {
                         // Move the file to the newly chosen category's folder, keeping its name.
@@ -259,7 +276,14 @@ impl AddDialog {
                             }
                         }
                     }
-                    if let Some(info) = &self.info {
+                    let checksum = self.checksum.trim();
+                    if !checksum.is_empty() && rdm_core::checksum::parse(checksum).is_none() {
+                        ui.label(RichText::new("The checksum is not a valid MD5, SHA-1 or SHA-256 value.").color(RED));
+                    }
+                    if self.is_stream {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Video stream (HLS) — the best quality is downloaded and joined into one file").color(GREEN));
+                    } else if let Some(info) = &self.info {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(info.size.map(format_size).unwrap_or_else(|| "Size unknown".into())).strong());
@@ -422,7 +446,7 @@ impl BatchDialog {
     }
 
     fn url(&self, n: u32) -> String {
-        self.template.replacen('*', &format!("{:0width$}", n, width = self.digits as usize), 1)
+        rdm_core::util::expand_template(&self.template, n, n, self.digits as usize, 1).pop().unwrap_or_default()
     }
 
     pub fn show(&mut self, ctx: &egui::Context, manager: &Manager) -> bool {
@@ -594,6 +618,7 @@ impl OptionsDialog {
 
     fn general(&mut self, ui: &mut egui::Ui) {
         ui.checkbox(&mut self.cfg.monitor_clipboard, "Monitor the clipboard for download links");
+        ui.checkbox(&mut self.cfg.close_to_tray, "Closing the window keeps RDM running in the notification area");
         ui.checkbox(&mut self.cfg.dark_mode, "Dark theme");
         ui.add_space(10.0);
         ui.label(RichText::new("Browser integration").strong());
@@ -989,4 +1014,122 @@ pub fn run_power_action(action: PostAction) {
     }
     #[cfg(not(windows))]
     let _ = action;
+}
+
+// ---------------------------------------------------------------- Link grabber
+
+/// "Site grabber" for a single page: list the files it links to and pick some.
+pub struct GrabDialog {
+    url: String,
+    extensions: String,
+    ticket: Option<rdm_core::manager::GrabTicket>,
+    links: Vec<(bool, rdm_core::grabber::GrabbedLink)>,
+    error: Option<String>,
+    searched: bool,
+    start_now: bool,
+}
+
+impl GrabDialog {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            url: String::new(),
+            extensions: config.capture_extensions.join(" "),
+            ticket: None,
+            links: Vec::new(),
+            error: None,
+            searched: false,
+            start_now: false,
+        }
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, manager: &Manager) -> bool {
+        if let Some(result) = self.ticket.as_ref().and_then(|t| t.result()) {
+            self.ticket = None;
+            self.searched = true;
+            match result {
+                Ok(links) => {
+                    self.links = links.into_iter().map(|l| (true, l)).collect();
+                    self.error = None;
+                }
+                Err(e) => {
+                    self.links.clear();
+                    self.error = Some(e);
+                }
+            }
+        }
+        let busy = self.ticket.is_some();
+        if busy {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        let mut open = true;
+        let mut close = false;
+        dialog("Grab links from a page").open(&mut open).show(ctx, |ui| {
+            ui.set_width(620.0);
+            egui::Grid::new("grab").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Page address");
+                ui.add(egui::TextEdit::singleline(&mut self.url).desired_width(500.0).hint_text("https://…"));
+                ui.end_row();
+                ui.label("File types");
+                ui.add(egui::TextEdit::singleline(&mut self.extensions).desired_width(500.0).hint_text("leave empty for every linked file"));
+                ui.end_row();
+            });
+            let url_ok = self.url.trim().starts_with("http://") || self.url.trim().starts_with("https://");
+            ui.horizontal(|ui| {
+                if ui.add_enabled(url_ok && !busy, egui::Button::new("Find links").min_size([110.0, 24.0].into())).clicked() {
+                    let extensions = self.extensions.split_whitespace().map(|e| e.trim_start_matches('.').to_ascii_lowercase()).collect();
+                    self.ticket = Some(manager.grab(RequestSpec::new(self.url.trim()), extensions));
+                }
+                if busy {
+                    ui.spinner();
+                    ui.label("Reading the page…");
+                }
+            });
+            if let Some(err) = &self.error {
+                ui.label(RichText::new(err).color(RED));
+            }
+
+            ui.separator();
+            let chosen = self.links.iter().filter(|(on, _)| *on).count();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} files found, {chosen} selected", self.links.len())).strong());
+                if ui.small_button("All").clicked() {
+                    self.links.iter_mut().for_each(|(on, _)| *on = true);
+                }
+                if ui.small_button("None").clicked() {
+                    self.links.iter_mut().for_each(|(on, _)| *on = false);
+                }
+            });
+            egui::ScrollArea::vertical().max_height(220.0).min_scrolled_height(220.0).auto_shrink([false, false]).show(ui, |ui| {
+                if self.links.is_empty() && self.searched && self.error.is_none() {
+                    ui.label(RichText::new("No links to files of these types on that page.").weak());
+                }
+                for (i, (on, link)) in self.links.iter_mut().enumerate() {
+                    ui.push_id(i, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(on, "");
+                            ui.add(egui::Label::new(link.file_name.as_str()).truncate()).on_hover_text(link.url.as_str());
+                        });
+                    });
+                }
+            });
+            ui.separator();
+            ui.checkbox(&mut self.start_now, "Start downloading immediately (otherwise add to the main queue)");
+            ui.horizontal(|ui| {
+                if ui.add_enabled(chosen > 0, egui::Button::new(format!("Add {chosen} downloads")).min_size([150.0, 24.0].into())).clicked() {
+                    for (_, link) in self.links.iter().filter(|(on, _)| *on) {
+                        let mut new = NewDownload::new(RequestSpec { url: link.url.clone(), referer: Some(self.url.trim().to_string()), ..Default::default() });
+                        new.start = self.start_now;
+                        new.queue = (!self.start_now).then_some(MAIN_QUEUE);
+                        manager.add(new);
+                    }
+                    close = true;
+                }
+                if ui.add_sized([90.0, 24.0], egui::Button::new("Close")).clicked() {
+                    close = true;
+                }
+            });
+        });
+        open && !close
+    }
 }

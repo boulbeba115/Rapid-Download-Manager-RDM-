@@ -3,18 +3,11 @@
 // No console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod dialogs;
-mod progress;
-mod theme;
-mod widgets;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
-
-use app::Launch;
+use rdm_app::app::{Launch, RdmApp};
 
 fn parse_args() -> Launch {
     let mut launch = Launch::default();
@@ -24,39 +17,23 @@ fn parse_args() -> Launch {
             "--data-dir" => launch.data_dir = it.next().map(PathBuf::from),
             "--screenshot" => launch.screenshot = it.next().map(PathBuf::from),
             "--show" => launch.show = it.next(),
+            // Start in the notification area (used by "start with Windows").
+            "--minimized" => launch.minimized = true,
             _ => launch.args.push(arg),
         }
     }
     launch
 }
 
+/// Settings live next to the executable when a `portable.txt` marker (or an
+/// existing `data` folder) is there, otherwise in `%APPDATA%\RDM`.
 fn default_data_dir() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join("RDM")
-}
-
-/// The window icon: a white download arrow on a blue rounded square.
-fn icon() -> egui::IconData {
-    const N: usize = 64;
-    let mut rgba = vec![0u8; N * N * 4];
-    for y in 0..N {
-        for x in 0..N {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            // Rounded square.
-            let r = 12.0;
-            let (cx, cy) = (fx.clamp(r, N as f32 - r), fy.clamp(r, N as f32 - r));
-            let inside = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() <= r;
-            if !inside {
-                continue;
-            }
-            // Arrow: shaft, head, and a tray line underneath.
-            let shaft = (26.0..=38.0).contains(&fx) && (12.0..=32.0).contains(&fy);
-            let head = (30.0..=46.0).contains(&fy) && (fx - 32.0).abs() <= (46.0 - fy);
-            let tray = (14.0..=50.0).contains(&fx) && (50.0..=55.0).contains(&fy);
-            let px = if shaft || head || tray { [255, 255, 255, 255] } else { [0x1E, 0x7F, 0xD6, 255] };
-            rgba[(y * N + x) * 4..(y * N + x) * 4 + 4].copy_from_slice(&px);
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) {
+        if dir.join("portable.txt").exists() || dir.join("data").join("config.json").exists() {
+            return dir.join("data");
         }
     }
-    egui::IconData { rgba, width: N as u32, height: N as u32 }
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join("RDM")
 }
 
 fn main() -> eframe::Result {
@@ -71,18 +48,22 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     }
+    rdm_app::logging::init(&data_dir);
+    log::info!("RDM {} starting, data in {}", env!("CARGO_PKG_VERSION"), data_dir.display());
 
+    let icon = egui::IconData { rgba: rdm_app::icon::render(64), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rapid Download Manager")
             .with_inner_size([1120.0, 640.0])
             .with_min_inner_size([680.0, 380.0])
-            .with_icon(Arc::new(icon())),
+            .with_visible(!launch.minimized)
+            .with_icon(Arc::new(icon)),
         ..Default::default()
     };
     eframe::run_native(
         "Rapid Download Manager",
         options,
-        Box::new(move |cc| Ok(Box::new(app::RdmApp::new(cc, data_dir, launch)?))),
+        Box::new(move |cc| Ok(Box::new(RdmApp::new(cc, data_dir, launch)?))),
     )
 }
