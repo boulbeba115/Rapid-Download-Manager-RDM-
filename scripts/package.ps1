@@ -99,7 +99,8 @@ Compress-Archive -Path $portableDir -DestinationPath $zip -CompressionLevel Opti
 $sums = foreach ($file in $setup, $zip) {
     "{0}  {1}" -f (Get-FileHash $file -Algorithm SHA256).Hash.ToLower(), (Split-Path -Leaf $file)
 }
-Set-Content -Path (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii -Value $sums
+# Unix line endings, so `sha256sum -c SHA256SUMS.txt` accepts the file everywhere.
+[IO.File]::WriteAllText((Join-Path $dist "SHA256SUMS.txt"), (($sums -join "`n") + "`n"), (New-Object Text.ASCIIEncoding))
 
 Write-Host ""
 Write-Host "Artifacts in $dist"
