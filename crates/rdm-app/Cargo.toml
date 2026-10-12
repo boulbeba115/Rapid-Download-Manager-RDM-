@@ -1,0 +1,19 @@
+[package]
+name = "rdm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rdm"
+path = "src/main.rs"
+
+[dependencies]
+rdm-core = { version = "0.1.0", path = "../rdm-core" }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+egui_extras = "0.36.2"
+rfd = "0.17.2"
+arboard = "3.6.1"
+open = "5.4.4"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }

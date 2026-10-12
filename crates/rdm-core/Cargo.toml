@@ -1,0 +1,35 @@
+[package]
+name = "rdm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Fault-injecting HTTP server used by the integration tests and `rdmc bench`.
+testserver = []
+
+[dependencies]
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+dirs = "7.0.0"
+fastrand = "2.5.0"
+futures-util = "0.3.34"
+hex = "0.4.3"
+log = "0.4.34"
+md-5 = "0.11.0"
+parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "stream", "socks", "system-proxy"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
+url = "2.5.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl"] }
+
+[dev-dependencies]
+rdm-core = { path = ".", features = ["testserver"] }

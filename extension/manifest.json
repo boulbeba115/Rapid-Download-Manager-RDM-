@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Rapid Download Manager integration",
+  "version": "0.1.0",
+  "description": "Hands downloads to Rapid Download Manager running on this computer.",
+  "permissions": ["downloads", "contextMenus", "cookies", "storage"],
+  "host_permissions": ["http://127.0.0.1/*", "<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Rapid Download Manager",
+    "default_popup": "popup.html"
+  }
+}
