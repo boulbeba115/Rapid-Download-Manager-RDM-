@@ -482,6 +482,7 @@ pub async fn run(client: Client, cfg: HlsConfig, plan: Plan, progress: Arc<Progr
                 return Outcome::Failed(format!("cannot save {}: {e}", cfg.final_path.display()));
             }
             let _ = std::fs::remove_file(&state_file);
+            crate::security::mark_of_the_web(&cfg.final_path, &cfg.spec.url);
             Outcome::Complete
         }
         other => {

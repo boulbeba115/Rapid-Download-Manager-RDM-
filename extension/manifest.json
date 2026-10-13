@@ -1,15 +1,63 @@
 {
   "manifest_version": 3,
   "name": "Rapid Download Manager integration",
-  "version": "0.1.0",
-  "description": "Hands downloads to Rapid Download Manager running on this computer.",
-  "permissions": ["downloads", "contextMenus", "cookies", "storage"],
-  "host_permissions": ["http://127.0.0.1/*", "<all_urls>"],
+  "version": "0.2.0",
+  "description": "Sends downloads and videos from the browser to Rapid Download Manager on this computer.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnBsdgd/3ovUGj0EZDkUf2tKGK6/cuYvP+JPKdindRb2q1qNfQQ5x1FkWxaCyVlF/CKBtNeTo000ZVy7njg+qiroZwv2a5gwdMs8/5uz3hSwyGYm5h1pn/Xoka75VAAouN34dnCLNg5LUXSfxdAIopwhmqTQRjChzjjkZuLXVS4bkR6JEqnMlSchWdHKmgcXdPfHjX0XOLouvFclhUBtORr4/fcVSPnQ5YUnOvTcZD4NYJkoX4Otnhw3eL8FWHsGrlnU+y8L2I3me3j5HYca9E7APd9veTzbS2HoI6OEdwFFA+j8jblkqpiAIL2DrIb97o3TBREbt8hTwLDKNbc+2jQIDAQAB",
+  "minimum_chrome_version": "111",
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "permissions": [
+    "downloads",
+    "contextMenus",
+    "cookies",
+    "storage",
+    "nativeMessaging",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://*.facebook.com/*"
+      ],
+      "js": [
+        "page-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
   "action": {
     "default_title": "Rapid Download Manager",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"
   }
 }

@@ -1,7 +1,7 @@
 //! The `.rdmstate` resume file and crash-safe JSON persistence.
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,25 @@ impl ResumeState {
     }
 }
 
+/// The folder next to the executable that a portable copy keeps its settings
+/// in: used when a `portable.txt` marker (or an existing `data` folder) is there.
+pub fn portable_data_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    (dir.join("portable.txt").exists() || dir.join("data").join("config.json").exists()).then(|| dir.join("data"))
+}
+
+/// Where settings and the download list live: `RDM_DATA_DIR` if set (automated
+/// tests that must not touch the real profile), the portable folder, otherwise
+/// `%APPDATA%\RDM`. Every RDM program resolves it the same way, which is how
+/// `rdm-host` finds the running application's port and secret.
+pub fn default_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("RDM_DATA_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    portable_data_dir()
+        .unwrap_or_else(|| std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join("RDM"))
+}
+
 pub fn load_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
     let data = std::fs::read(path).ok()?;
     serde_json::from_slice(&data).ok()
@@ -60,7 +79,7 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     }
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
+    let tmp = PathBuf::from(tmp);
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&data)?;

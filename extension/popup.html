@@ -1,22 +1,22 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
-    <style>
-      body { font: 13px system-ui, sans-serif; width: 250px; margin: 12px; }
-      h1 { font-size: 14px; margin: 0 0 8px; }
-      label { display: flex; align-items: center; gap: 6px; margin: 8px 0; }
-      input[type="number"] { width: 80px; }
-      #status { margin-top: 8px; padding: 6px 8px; border-radius: 4px; background: #eee; }
-      #status.ok { background: #dff3e4; color: #1b6b34; }
-      #status.bad { background: #fbe3e3; color: #8a1f1f; }
-    </style>
+    <title>Rapid Download Manager</title>
+    <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <h1>Rapid Download Manager</h1>
-    <label><input type="checkbox" id="enabled" /> Capture downloads</label>
-    <label>Port <input type="number" id="port" min="1024" max="65535" /></label>
-    <div id="status">Checking…</div>
+    <header>
+      <img src="icons/32.png" width="20" height="20" alt="" />
+      <h1>Rapid Download Manager</h1>
+    </header>
+    <div id="status" role="status">Checking…</div>
+    <label><input type="checkbox" id="enabled" /> Take over downloads from the browser</label>
+    <label><input type="checkbox" id="videoButton" /> Show the download button on videos</label>
+    <section id="media-section" hidden>
+      <h2>Media on this page</h2>
+      <ul id="media"></ul>
+    </section>
     <script src="popup.js"></script>
   </body>
 </html>

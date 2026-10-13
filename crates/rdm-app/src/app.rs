@@ -12,11 +12,12 @@ use rdm_core::manager::{AddRequest, Event, PostAction, MAIN_QUEUE};
 use rdm_core::util::{eta_secs, format_duration, format_size, format_speed};
 use rdm_core::{Config, Id, Manager, NewDownload, Queue, RequestSpec, Status, View};
 
+use crate::browser_setup::BrowserSetupDialog;
 use crate::dialogs::{AddDialog, AddOutcome, BatchDialog, DeleteDialog, GrabDialog, OptionsDialog, PowerCountdown, PropertiesDialog, SchedulerDialog};
 use crate::progress::{reveal_in_folder, CompleteDialog, ProgressWindow};
 use crate::theme::{self, category_color, GREEN, ORANGE, RED};
 use crate::tray::{Tray, TrayAction};
-use crate::widgets::{file_badge, mini_progress, tool_button, Icon};
+use crate::widgets::{clear_button, file_badge, highlighted, magnifier, mini_progress, tool_button, Icon};
 
 /// Launch options that belong to this process (not forwarded to a running instance).
 #[derive(Default, Clone)]
@@ -24,7 +25,7 @@ pub struct Launch {
     pub data_dir: Option<PathBuf>,
     /// Render for a moment, save a PNG of the window here, and exit.
     pub screenshot: Option<PathBuf>,
-    /// With `screenshot`: which dialog to have open (`add`, `options`, `scheduler`, `progress`).
+    /// With `screenshot`: what to show (`add`, `options`, `scheduler`, `progress`, `browser`, `search=words`).
     pub show: Option<String>,
     /// Start hidden in the notification area.
     pub minimized: bool,
@@ -32,6 +33,8 @@ pub struct Launch {
     pub headless: bool,
     /// IDM-style arguments (`/d URL` …) to act on.
     pub args: Vec<String>,
+    /// The loopback port, already claimed by `main` (see `claim_instance` there).
+    pub listener: Option<Arc<std::net::TcpListener>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -75,6 +78,7 @@ pub struct RdmApp {
     properties: Option<PropertiesDialog>,
     batch: Option<BatchDialog>,
     grab: Option<GrabDialog>,
+    browser_setup: Option<BrowserSetupDialog>,
     about: bool,
     power: Option<PowerCountdown>,
     progress: BTreeMap<Id, ProgressWindow>,
@@ -85,6 +89,8 @@ pub struct RdmApp {
     clipboard_checked: Instant,
 
     tray: Option<Tray>,
+    /// What the tray icon's tooltip currently says.
+    tray_tip: String,
     /// The window is hidden in the notification area.
     hidden: bool,
     hide_asserted: u8,
@@ -118,8 +124,12 @@ impl RdmApp {
         let config = manager.config();
         theme::apply(&cc.egui_ctx, config.dark_mode);
 
-        let api_status = match manager.start_api() {
-            Ok(port) => format!("Listening for the browser extension on 127.0.0.1:{port}"),
+        let api = match &launch.listener {
+            Some(claimed) => claimed.try_clone().and_then(|listener| manager.start_api_on(listener)),
+            None => manager.start_api(),
+        };
+        let api_status = match api {
+            Ok(port) => format!("Listening for the browser extension's helper on 127.0.0.1:{port}"),
             Err(e) => format!("Browser integration is off: port {} is unavailable ({e})", config.api_port),
         };
         if !launch.args.is_empty() {
@@ -158,6 +168,7 @@ impl RdmApp {
             properties: None,
             batch: None,
             grab: None,
+            browser_setup: None,
             about: false,
             power: None,
             progress: BTreeMap::new(),
@@ -166,6 +177,7 @@ impl RdmApp {
             clipboard_seen: String::new(),
             clipboard_checked: Instant::now(),
             tray,
+            tray_tip: String::new(),
             hidden,
             hide_asserted: 0,
             quit_after: BTreeSet::new(),
@@ -197,11 +209,43 @@ impl RdmApp {
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
     }
 
+    /// Send the main window to the notification area (it keeps working there).
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        if self.tray.is_some() {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
+            self.hidden = true;
+        }
+    }
+
+    /// Keep the tray icon's tooltip telling what is going on while windows are hidden.
+    fn update_tray_tip(&mut self) {
+        let Some(tray) = &self.tray else { return };
+        let active: Vec<&View> = self.views.iter().filter(|v| v.d.status == Status::Running).collect();
+        let tip = match active.as_slice() {
+            [] => "Rapid Download Manager".to_string(),
+            [one] => {
+                let done = percent(one).map(|p| format!("{p:.0}% of ")).unwrap_or_default();
+                format!("RDM: {done}{}\n{}", one.d.file_name, format_speed(one.speed))
+            }
+            many => format!("RDM: {} downloads\n{}", many.len(), format_speed(many.iter().map(|v| v.speed).sum())),
+        };
+        if tip != self.tray_tip {
+            tray.set_tooltip(&tip);
+            self.tray_tip = tip;
+        }
+    }
+
     fn handle_tray(&mut self, ctx: &egui::Context) {
         let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
         for action in actions {
             match action {
-                TrayAction::Show => self.show_window(ctx),
+                TrayAction::Show => {
+                    self.show_window(ctx);
+                    // Progress windows sent to the notification area come back with it.
+                    for window in self.progress.values_mut() {
+                        window.hidden = false;
+                    }
+                }
                 TrayAction::AddUrl => {
                     self.show_window(ctx);
                     self.open_add();
@@ -220,8 +264,7 @@ impl RdmApp {
         }
         if self.tray.is_some() && self.config.close_to_tray {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.hidden = true;
+            self.hide_window(ctx);
         }
     }
 
@@ -292,7 +335,8 @@ impl RdmApp {
     fn open_progress(&mut self, id: Id) {
         let announce = self.config.show_complete_dialog;
         let view = self.manager.view(id);
-        self.progress.entry(id).or_insert_with(|| ProgressWindow::new(id, view.as_ref(), announce));
+        // Also brings back a window that was hidden in the notification area.
+        self.progress.entry(id).or_insert_with(|| ProgressWindow::new(id, view.as_ref(), announce)).hidden = false;
     }
 
     // ---- Actions on the selection --------------------------------------
@@ -371,6 +415,10 @@ impl RdmApp {
                     action => self.power = Some(PowerCountdown { action, deadline: Instant::now() + Duration::from_secs(60) }),
                 },
                 Event::ShowWindow => self.show_window(ctx),
+                Event::BrowserSetup => {
+                    self.browser_setup = Some(BrowserSetupDialog::new());
+                    self.show_window(ctx);
+                }
                 Event::Quit => self.quit = true,
             }
         }
@@ -510,8 +558,21 @@ impl RdmApp {
                     self.sort = None;
                     ui.close();
                 }
+                if ui.button("Find…  (Ctrl+F)").clicked() {
+                    ui.memory_mut(|m| m.request_focus(search_id()));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add_enabled(self.tray.is_some(), egui::Button::new("Hide to notification area")).clicked() {
+                    self.hide_window(ui.ctx());
+                    ui.close();
+                }
             });
             ui.menu_button("Help", |ui| {
+                if ui.button("Browser integration…").clicked() {
+                    self.browser_setup = Some(BrowserSetupDialog::new());
+                    ui.close();
+                }
                 if ui.button("About").clicked() {
                     self.about = true;
                     ui.close();
@@ -568,9 +629,54 @@ impl RdmApp {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(6.0);
-                ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(170.0).hint_text("Search downloads"));
+                self.search_box(ui);
             });
         });
+    }
+
+    /// The search field: magnifier, text, a clear button once something is
+    /// typed, and how many downloads match. Ctrl+F jumps here, Esc empties it.
+    fn search_box(&mut self, ui: &mut egui::Ui) {
+        let id = search_id();
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let focused = ui.memory(|m| m.has_focus(id));
+        if focused && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.search.clear();
+        }
+
+        let visuals = ui.visuals();
+        let stroke = if focused { egui::Stroke::new(1.5, theme::ACCENT) } else { visuals.widgets.noninteractive.bg_stroke };
+        let frame = egui::Frame::NONE.fill(visuals.extreme_bg_color).stroke(stroke).corner_radius(5).inner_margin(egui::Margin::symmetric(7, 4));
+        frame.show(ui, |ui| {
+            ui.allocate_ui_with_layout(egui::vec2(SEARCH_WIDTH, 20.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                magnifier(ui);
+                let field = egui::TextEdit::singleline(&mut self.search)
+                    .id(id)
+                    .frame(egui::Frame::NONE)
+                    .desired_width(SEARCH_WIDTH - 46.0)
+                    .hint_text("Search downloads  (Ctrl+F)");
+                ui.add(field).on_hover_text("Every word must match the file name, address, description, category or status.\nCtrl+F to search, Esc to clear.");
+                if !self.search.is_empty() && clear_button(ui) {
+                    self.search.clear();
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+            });
+        });
+
+        let terms = search_terms(&self.search);
+        if !terms.is_empty() {
+            let shown = self.views.iter().filter(|v| matches_filter(&self.filter, v) && matches_search(v, &terms)).count();
+            let text = match shown {
+                0 => RichText::new("No match").color(RED),
+                1 => RichText::new("1 match").weak(),
+                n => RichText::new(format!("{n} matches")).weak(),
+            };
+            ui.add_space(4.0);
+            ui.label(text);
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -641,14 +747,9 @@ impl RdmApp {
     }
 
     fn visible_rows(&self) -> Vec<usize> {
-        let needle = self.search.trim().to_lowercase();
-        let mut rows: Vec<usize> = (0..self.views.len())
-            .filter(|&i| {
-                let v = &self.views[i];
-                matches_filter(&self.filter, v)
-                    && (needle.is_empty() || v.d.file_name.to_lowercase().contains(&needle) || v.d.spec.url.to_lowercase().contains(&needle))
-            })
-            .collect();
+        let terms = search_terms(&self.search);
+        let mut rows: Vec<usize> =
+            (0..self.views.len()).filter(|&i| matches_filter(&self.filter, &self.views[i]) && matches_search(&self.views[i], &terms)).collect();
         match self.sort {
             Some((col, ascending)) => {
                 let key = |i: &usize| {
@@ -682,6 +783,22 @@ impl RdmApp {
         if self.views.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("No downloads yet.\nClick \"Add URL\" or copy a link and press it.").weak());
+            });
+            return;
+        }
+        let terms = search_terms(&self.search);
+        if rows.is_empty() && !terms.is_empty() {
+            // Say why the list is empty, and offer the way out.
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.35);
+                ui.label(RichText::new(format!("No downloads match \"{}\"", self.search.trim())).weak());
+                if self.filter != Filter::All {
+                    ui.label(RichText::new("Only the selected category or queue is searched.").weak());
+                }
+                ui.add_space(6.0);
+                if ui.button("Clear search").clicked() {
+                    self.search.clear();
+                }
             });
             return;
         }
@@ -731,7 +848,11 @@ impl RdmApp {
 
                     row.col(|ui| {
                         file_badge(ui, category_color(&v.d.category));
-                        ui.label(&v.d.file_name);
+                        if terms.is_empty() {
+                            ui.label(&v.d.file_name);
+                        } else {
+                            ui.label(highlighted(ui, &v.d.file_name, &terms));
+                        }
                     });
                     row.col(|ui| {
                         if v.d.queue.is_some() {
@@ -971,7 +1092,11 @@ impl RdmApp {
         }
         if let Some(mut d) = self.options.take() {
             let mut applied = false;
-            if d.show(ctx, &self.manager, &mut applied) {
+            let keep = d.show(ctx, &self.manager, &mut applied);
+            if std::mem::take(&mut d.open_browser_setup) {
+                self.browser_setup = Some(BrowserSetupDialog::new());
+            }
+            if keep {
                 self.options = Some(d);
             }
             if applied {
@@ -982,6 +1107,12 @@ impl RdmApp {
         if let Some(mut d) = self.scheduler.take() {
             if d.show(ctx, &self.manager, &self.views) {
                 self.scheduler = Some(d);
+            }
+        }
+        // After Options, which can open it: the newer window goes on top.
+        if let Some(mut d) = self.browser_setup.take() {
+            if d.show(ctx) {
+                self.browser_setup = Some(d);
             }
         }
         if let Some(mut d) = self.properties.take() {
@@ -1021,7 +1152,8 @@ impl RdmApp {
 
         // Child windows.
         let manager = self.manager.clone();
-        self.progress.retain(|_, w| w.show(ctx, &manager));
+        let tray = self.tray.is_some();
+        self.progress.retain(|_, w| w.show(ctx, &manager, tray));
         let mut never_again = false;
         self.completed.retain_mut(|d| d.show(ctx, &manager, &mut never_again));
         if never_again {
@@ -1049,7 +1181,13 @@ impl RdmApp {
                         None => {}
                     }
                 }
-                _ => {}
+                "browser" => self.browser_setup = Some(BrowserSetupDialog::new()),
+                // `search=words`: the list as it looks while searching.
+                other => {
+                    if let Some(text) = other.strip_prefix("search=") {
+                        self.search = text.to_string();
+                    }
+                }
             }
         }
         if age > Duration::from_millis(4500) && !self.shot_requested {
@@ -1092,6 +1230,34 @@ enum RowAction {
     Properties(Id),
 }
 
+const SEARCH_WIDTH: f32 = 250.0;
+
+fn search_id() -> egui::Id {
+    egui::Id::new("search-downloads")
+}
+
+/// The words typed into the search box, lower-cased.
+fn search_terms(search: &str) -> Vec<String> {
+    search.split_whitespace().map(str::to_lowercase).collect()
+}
+
+/// Every word must be found somewhere in what the row shows or stands for,
+/// so "ubuntu iso paused" narrows down the way one expects.
+fn matches_search(v: &View, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let status = match v.d.status {
+        Status::Queued => "queued waiting",
+        Status::Running => "running downloading",
+        Status::Paused => "paused stopped",
+        Status::Complete => "complete finished",
+        Status::Failed => "failed error",
+    };
+    let haystack = format!("{}\n{}\n{}\n{}\n{status}", v.d.file_name, v.d.spec.url, v.d.description, v.d.category).to_lowercase();
+    terms.iter().all(|term| haystack.contains(term.as_str()))
+}
+
 fn matches_filter(filter: &Filter, v: &View) -> bool {
     match filter {
         Filter::All => true,
@@ -1130,6 +1296,7 @@ impl eframe::App for RdmApp {
         let active = self.views.iter().any(|v| v.d.status == Status::Running);
         if self.stale.swap(false, Ordering::Relaxed) || self.refreshed.elapsed() >= Duration::from_millis(if active { 100 } else { 500 }) {
             self.refresh();
+            self.update_tray_tip();
         }
         if self.quit {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);

@@ -41,6 +41,8 @@ pub enum Status {
 pub struct SiteLogin {
     pub host: String,
     pub user: String,
+    /// Encrypted in the settings file.
+    #[serde(with = "crate::security::secret")]
     pub password: String,
 }
 
@@ -249,6 +251,8 @@ pub enum Event {
     StartQueue(Id),
     /// Another instance was launched: bring the window to the front.
     ShowWindow,
+    /// Show the guide for adding the browser extension.
+    BrowserSetup,
     Quit,
 }
 
@@ -518,16 +522,24 @@ impl Manager {
         WeakManager { inner: Arc::downgrade(&self.inner) }
     }
 
-    /// Start the loopback API used by the browser extension and by second
-    /// instances of the app. Returns an error if the port is taken.
+    /// Start the loopback API used by the browser's native-messaging host and
+    /// by second instances of the app. Returns an error if the port is taken.
     pub fn start_api(&self) -> std::io::Result<u16> {
         let port = self.config().api_port;
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        self.start_api_on(std::net::TcpListener::bind(("127.0.0.1", port))?)
+    }
+
+    /// The same on a socket the caller has already bound (holding the port is
+    /// what makes an instance *the* running one). Returns the port in use.
+    pub fn start_api_on(&self, listener: std::net::TcpListener) -> std::io::Result<u16> {
+        let port = listener.local_addr()?.port();
+        // A new secret for every run; only this user's programs can read it.
+        let token = crate::api::create_token(&self.inner.data_dir)?;
         listener.set_nonblocking(true)?;
         let weak = self.downgrade();
         let _guard = self.inner.rt().enter();
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        self.inner.rt().spawn(crate::api::serve(listener, weak));
+        self.inner.rt().spawn(crate::api::serve(listener, weak, token));
         Ok(port)
     }
 

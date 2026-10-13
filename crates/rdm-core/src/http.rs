@@ -23,7 +23,13 @@ pub enum ProxyConfig {
     System,
     None,
     /// `http://host:port`, `https://host:port` or `socks5://host:port`.
-    Manual { url: String, username: String, password: String },
+    Manual {
+        url: String,
+        username: String,
+        /// Encrypted in the settings file.
+        #[serde(with = "crate::security::secret")]
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,9 +78,12 @@ pub fn build_client(cfg: &NetConfig) -> Result<Client> {
 pub struct RequestSpec {
     pub url: String,
     pub referer: Option<String>,
+    /// The browser's session for this site. Encrypted in the saved download list.
+    #[serde(with = "crate::security::secret_opt")]
     pub cookies: Option<String>,
     pub user_agent: Option<String>,
-    /// HTTP Basic credentials.
+    /// HTTP Basic credentials. The password is encrypted in the saved download list.
+    #[serde(with = "crate::security::secret_pair")]
     pub auth: Option<(String, String)>,
     pub headers: Vec<(String, String)>,
 }
@@ -85,23 +94,31 @@ impl RequestSpec {
     }
 }
 
+/// A GET for `url` on behalf of `spec`. `url` is not always `spec.url`: it
+/// may be where a redirect ended up, or a segment or key named by a playlist.
+/// The download's cookies, password and custom headers go along only as far
+/// as [`credential_scope`](crate::security::credential_scope) allows, so a
+/// redirect or a playlist cannot be used to collect them.
 pub fn request(client: &Client, spec: &RequestSpec, url: &str) -> RequestBuilder {
+    let (cookies_ok, secrets_ok) = crate::security::credential_scope(&spec.url, url);
     // Ranges address the bytes on disk, so the body must never be compressed in transit.
     let mut rb = client.get(url).header(header::ACCEPT, "*/*").header(header::ACCEPT_ENCODING, "identity");
     if let Some(v) = spec.referer.as_deref().filter(|v| !v.is_empty()) {
         rb = rb.header(header::REFERER, v);
     }
-    if let Some(v) = spec.cookies.as_deref().filter(|v| !v.is_empty()) {
+    if let Some(v) = spec.cookies.as_deref().filter(|v| cookies_ok && !v.is_empty()) {
         rb = rb.header(header::COOKIE, v);
     }
     if let Some(v) = spec.user_agent.as_deref().filter(|v| !v.is_empty()) {
         rb = rb.header(header::USER_AGENT, v);
     }
-    for (k, v) in &spec.headers {
-        rb = rb.header(k.as_str(), v.as_str());
-    }
-    if let Some((user, pass)) = &spec.auth {
-        rb = rb.basic_auth(user, Some(pass));
+    if secrets_ok {
+        for (k, v) in &spec.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        if let Some((user, pass)) = &spec.auth {
+            rb = rb.basic_auth(user, Some(pass));
+        }
     }
     rb
 }
@@ -201,6 +218,31 @@ pub async fn probe(client: &Client, spec: &RequestSpec) -> Result<Probe> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A redirect target or a playlist entry on someone else's server must not
+    /// receive the session cookie, the password or the custom headers.
+    #[test]
+    fn credentials_do_not_follow_a_request_to_another_site() {
+        let client = Client::new();
+        let spec = RequestSpec {
+            url: "https://files.example/get?id=1".into(),
+            referer: Some("https://files.example/".into()),
+            cookies: Some("sid=secret".into()),
+            auth: Some(("user".into(), "password".into())),
+            headers: vec![("X-Api-Key".into(), "key".into())],
+            ..Default::default()
+        };
+        let sent = |url: &str| {
+            let req = request(&client, &spec, url).build().unwrap();
+            let has = |name: &str| req.headers().contains_key(name);
+            (has("cookie"), has("authorization"), has("x-api-key"), has("referer"))
+        };
+        assert_eq!(sent(&spec.url), (true, true, true, true));
+        assert_eq!(sent("https://files.example/other"), (true, true, true, true));
+        assert_eq!(sent("https://cdn.files.example/part1"), (true, false, false, true));
+        assert_eq!(sent("https://collector.evil.test/x"), (false, false, false, true));
+        assert_eq!(sent("http://files.example/get?id=1"), (false, false, false, true));
+    }
 
     #[test]
     fn content_range() {

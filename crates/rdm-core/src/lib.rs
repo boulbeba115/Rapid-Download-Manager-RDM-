@@ -3,6 +3,7 @@
 //! No GUI code lives here. See `SPEC.md` §5 for the design this implements.
 
 pub mod api;
+pub mod browser;
 pub mod category;
 pub mod checksum;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod hls;
 pub mod http;
 pub mod limiter;
 pub mod manager;
+pub mod security;
 pub mod segment;
 pub mod state;
 pub mod task;

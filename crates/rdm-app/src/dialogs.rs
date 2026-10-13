@@ -525,6 +525,8 @@ pub struct OptionsDialog {
     new_limit: SiteLimit,
     error: Option<String>,
     pub api_status: String,
+    /// Set when the user asked for the browser set-up guide; the main window opens it.
+    pub open_browser_setup: bool,
 }
 
 const CONNECTION_CHOICES: [u32; 7] = [1, 2, 4, 8, 16, 24, 32];
@@ -547,6 +549,7 @@ impl OptionsDialog {
             new_limit: SiteLimit { host: String::new(), connections: 1 },
             error: None,
             api_status,
+            open_browser_setup: false,
             tab: OptTab::General,
             cfg,
         }
@@ -635,11 +638,15 @@ impl OptionsDialog {
         ui.label(&self.api_status);
         ui.label(
             RichText::new(
-                "Install the extension from the \"extension\" folder: open chrome://extensions (or edge://extensions), \
-                 enable Developer mode, choose \"Load unpacked\" and select that folder.",
+                "The extension reaches RDM through the browser's native messaging, which only lets RDM's own extension in. \
+                 This port is for RDM's helper programs on this computer; web pages and other extensions are refused.",
             )
             .weak(),
         );
+        ui.add_space(4.0);
+        if ui.button("Set up the browser extension…").clicked() {
+            self.open_browser_setup = true;
+        }
     }
 
     fn file_types(&mut self, ui: &mut egui::Ui) {

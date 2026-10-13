@@ -3,8 +3,10 @@
 // No console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use eframe::egui;
 use rdm_app::app::{Launch, RdmApp};
@@ -25,31 +27,42 @@ fn parse_args() -> Launch {
     launch
 }
 
-/// Settings live next to the executable when a `portable.txt` marker (or an
-/// existing `data` folder) is there, otherwise in `%APPDATA%\RDM`.
-fn default_data_dir() -> PathBuf {
-    // Explicit override, e.g. for automated tests that must not touch the real profile.
-    if let Some(dir) = std::env::var_os("RDM_DATA_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) {
-        if dir.join("portable.txt").exists() || dir.join("data").join("config.json").exists() {
-            return dir.join("data");
+/// Become the running instance, or hand our arguments to the one that already is.
+///
+/// Holding the loopback port is what makes an instance *the* instance, so the
+/// port is taken here, before any window exists. `None` means another
+/// instance took our arguments and this process should exit.
+fn claim_instance(data_dir: &Path, args: &[String]) -> Option<Option<TcpListener>> {
+    let port = rdm_core::state::load_json::<rdm_core::Config>(&data_dir.join("config.json")).map(|c| c.api_port).unwrap_or(rdm_core::manager::DEFAULT_API_PORT);
+    // Two instances started at the same moment (the installer's last page can do
+    // that): the loser of the race for the port waits for the winner to listen.
+    for _ in 0..20 {
+        if rdm_core::api::forward_to_running(port, data_dir, args) {
+            return None;
+        }
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return Some(Some(listener)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => std::thread::sleep(Duration::from_millis(150)),
+            Err(_) => break,
         }
     }
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join("RDM")
+    // The port belongs to something else: run anyway, without browser integration.
+    Some(None)
 }
 
 fn main() -> eframe::Result {
-    let launch = parse_args();
-    let data_dir = launch.data_dir.clone().unwrap_or_else(default_data_dir);
+    let mut launch = parse_args();
+    let portable = rdm_core::state::portable_data_dir();
+    let data_dir = launch.data_dir.clone().unwrap_or_else(rdm_core::state::default_data_dir);
+    // A portable copy must keep working when its folder is carried to another PC,
+    // so its saved passwords are not tied to this Windows account.
+    rdm_core::security::set_protect_at_rest(portable.as_deref() != Some(data_dir.as_path()));
 
-    // Single instance: if RDM is already running, hand it our arguments and leave.
-    // (Screenshot runs use their own data directory and are always separate.)
+    // Single instance. (Screenshot runs use their own data directory and are always separate.)
     if launch.screenshot.is_none() {
-        let port = rdm_core::state::load_json::<rdm_core::Config>(&data_dir.join("config.json")).map(|c| c.api_port).unwrap_or(rdm_core::manager::DEFAULT_API_PORT);
-        if rdm_core::api::forward_to_running(port, &launch.args) {
-            return Ok(());
+        match claim_instance(&data_dir, &launch.args) {
+            None => return Ok(()),
+            Some(listener) => launch.listener = listener.map(Arc::new),
         }
     }
     rdm_app::logging::init(&data_dir);

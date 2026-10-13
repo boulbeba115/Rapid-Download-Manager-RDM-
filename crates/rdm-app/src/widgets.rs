@@ -1,7 +1,8 @@
 //! Custom-painted pieces: toolbar buttons with vector icons, the file badge,
 //! and the segment map.
 
-use eframe::egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
+use eframe::egui::text::LayoutJob;
+use eframe::egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, TextFormat, TextStyle, Ui};
 use rdm_core::segment::SegSnapshot;
 
 use crate::theme::{ACCENT, GREEN, ORANGE, RED};
@@ -117,6 +118,71 @@ fn paint_icon(p: &Painter, r: Rect, icon: Icon, enabled: bool, dark: bool) {
             }
         }
     }
+}
+
+/// The magnifying glass at the left of the search field.
+pub fn magnifier(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+    let stroke = Stroke::new(1.6, ui.visuals().weak_text_color());
+    let centre = pos2(rect.left() + 5.5, rect.top() + 5.5);
+    ui.painter().circle_stroke(centre, 4.2, stroke);
+    ui.painter().line_segment([pos2(centre.x + 3.2, centre.y + 3.2), pos2(rect.right() - 0.5, rect.bottom() - 0.5)], stroke);
+}
+
+/// The small × that empties the search field. Returns true when clicked.
+pub fn clear_button(ui: &mut Ui) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+    resp.widget_info(|| eframe::egui::WidgetInfo::labeled(eframe::egui::WidgetType::Button, true, "Clear search"));
+    if resp.hovered() {
+        ui.painter().circle_filled(rect.center(), 8.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let color = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+    let (c, r) = (rect.center(), 3.2);
+    for dir in [1.0, -1.0] {
+        ui.painter().line_segment([pos2(c.x - r, c.y - r * dir), pos2(c.x + r, c.y + r * dir)], Stroke::new(1.6, color));
+    }
+    resp.on_hover_text("Clear search").clicked()
+}
+
+/// `text` with every occurrence of the search words marked, for the list.
+pub fn highlighted(ui: &Ui, text: &str, terms: &[String]) -> LayoutJob {
+    let font = TextStyle::Body.resolve(ui.style());
+    // The row decides the colour of ordinary text (it differs when selected).
+    let plain = TextFormat { font_id: font.clone(), color: Color32::PLACEHOLDER, ..Default::default() };
+    let marked = TextFormat { font_id: font, color: Color32::from_gray(25), background: Color32::from_rgb(0xFF, 0xD5, 0x4F), ..Default::default() };
+
+    // Byte ranges that match, found in the lower-cased text. That is only
+    // valid if lower-casing kept every character's width, which it does for
+    // nearly all text; otherwise nothing is marked rather than the wrong part.
+    let lower = text.to_lowercase();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    if lower.len() == text.len() {
+        for term in terms.iter().filter(|t| !t.is_empty()) {
+            let mut from = 0;
+            while let Some(at) = lower[from..].find(term.as_str()) {
+                let (start, end) = (from + at, from + at + term.len());
+                if text.is_char_boundary(start) && text.is_char_boundary(end) {
+                    ranges.push((start, end));
+                }
+                from = end;
+            }
+        }
+    }
+    ranges.sort_unstable();
+
+    let mut job = LayoutJob::default();
+    let mut at = 0;
+    for (start, end) in ranges {
+        if end <= at {
+            continue;
+        }
+        let start = start.max(at);
+        job.append(&text[at..start], 0.0, plain.clone());
+        job.append(&text[start..end], 0.0, marked.clone());
+        at = end;
+    }
+    job.append(&text[at..], 0.0, plain);
+    job
 }
 
 /// Small "document" badge in the category colour, drawn left of a file name.

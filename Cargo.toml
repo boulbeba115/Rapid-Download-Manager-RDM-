@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/rdm-core", "crates/rdm-cli", "crates/rdm-app", "crates/xtask"]
+members = ["crates/rdm-core", "crates/rdm-cli", "crates/rdm-app", "crates/rdm-host", "crates/xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 

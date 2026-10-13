@@ -9,7 +9,7 @@ name = "rdm"
 path = "src/main.rs"
 
 [dependencies]
-rdm-core = { version = "0.1.0", path = "../rdm-core" }
+rdm-core = { version = "0.2.0", path = "../rdm-core" }
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
 egui_extras = "0.36.2"
 rfd = "0.17.2"

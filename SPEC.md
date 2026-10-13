@@ -40,7 +40,7 @@ Status legend used throughout: **M1…M6** = milestone in which the item ships
 | TLS | Windows SChannel via `native-tls` | OS certificate store, AES-NI, no C toolchain needed |
 | GUI | `egui` / `eframe` (GPU-accelerated immediate mode) | Single binary, 60 fps tables, real OS windows for progress dialogs |
 | Persistence | Atomic JSON files (`serde_json`, write-temp-then-rename) | Human-readable, crash-safe, no native DB dependency |
-| Browser integration | WebExtension (MV3) → loopback HTTP API | No native-messaging host to register; works in Chrome/Edge/Firefox |
+| Browser integration | WebExtension (MV3) → native messaging → `rdm-host` → loopback API | The browser itself restricts the channel to RDM's extension (see §9; the first version used the loopback API directly) |
 
 Constraint that follows from the target: **no dependency may need a C compiler.**
 
@@ -99,10 +99,13 @@ rdm/                       Cargo workspace
 │  │   ├─ category.rs      Extension → category → folder
 │  │   ├─ filename.rs      Content-Disposition / URL / MIME → safe file name
 │  │   ├─ config.rs        Settings (serde)
-│  │   └─ api.rs           Loopback HTTP API (browser extension, CLI forwarding)
+│  │   ├─ api.rs           Loopback HTTP API (the browser host, second instances)
+│  │   ├─ browser.rs       Native-messaging registration for the browsers
+│  │   └─ security.rs      Tokens, credential scope, mark of the web, secrets at rest
 │  ├─ rdm-app/             `rdm.exe` — GUI shell (eframe)
+│  ├─ rdm-host/            `rdm-host.exe` — native-messaging host the browser starts
 │  └─ rdm-cli/             `rdmc.exe` — headless client, used for benchmarks and CI
-├─ extension/              WebExtension (Chrome / Edge / Firefox)
+├─ extension/              WebExtension (Chrome / Edge / Brave)
 └─ SPEC.md
 ```
 
@@ -371,17 +374,70 @@ completed.
 
 ## 9. Browser integration
 
-- `extension/` (Manifest V3): watches `downloads.onCreated`; when the file
-  extension/MIME matches the capture list and the size exceeds a threshold, it
-  cancels the browser's download and POSTs `{url, referer, cookies, userAgent,
-  fileName}` to RDM. Adds a "Download with RDM" context-menu item for links.
-  Holding **Alt** bypasses capture (IDM convention).
-- RDM listens on `127.0.0.1:<port>` (loopback only). Requests must carry
-  `Content-Type: application/json` and an `Origin` of `chrome-extension://…` or
-  `moz-extension://…`; CORS pre-flights from ordinary web pages are refused, so
-  a web page cannot drive RDM. Captured downloads always show the Download File
-  Info dialog unless the user turned it off.
-- If RDM is not running the extension lets the browser handle the download.
+_Revised in 0.2.0: the extension no longer talks to the loopback port. The
+original design (any `chrome-extension://` origin accepted over HTTP) let every
+installed extension drive RDM, including choosing the folder and skipping the
+dialog._
+
+**Channel.** Native messaging. The browser starts `rdm-host.exe` and pipes
+length-prefixed JSON to it, but only for the extension IDs in the host manifest
+(`rdm-host.json`, found through `HKCU\Software\<browser>\NativeMessagingHosts`).
+The extension's ID is fixed by the `key` in its manifest. The host understands
+`status` and `add`, validates every field, and forwards to the application over
+the loopback API with the per-run secret. If the application is not running the
+host starts it (`rdm.exe --minimized`) and waits for it.
+
+**Loopback API** (`127.0.0.1:<port>`, for RDM's own programs only). Every
+request needs `X-RDM-Token` equal to the 256-bit secret written to `api-token`
+in the data directory at start-up (compared in constant time). A request with
+an `Origin` header, or a `Host` that is not the loopback address, is refused
+with or without the secret; no CORS headers are sent. `/add` (from the host) is
+reduced to url, referer, cookies, user agent and a sanitised file name — never
+a folder, never "silent" — and always opens the Download File Info dialog.
+`/cli` carries the command line of a second instance.
+
+**Extension** (`extension/`, Manifest V3, Chrome / Edge / Brave):
+- *Downloads*: `downloads.onDeterminingFilename` (the name is known, nothing is
+  saved yet, and the download cannot finish until the listener answers). If the
+  type is in the capture list the browser's copy is paused, the link is offered
+  to RDM, and only after RDM accepted is the copy cancelled and erased;
+  otherwise it is resumed. Never both, never neither.
+- *Media*: `webRequest.onHeadersReceived` notes, per tab, media files fetched
+  by a `<video>`/`<audio>` element and HLS playlists (fragments of adaptive
+  streams are ignored). The content script shows a "Download with RDM" button
+  over a video (closed shadow tree, trusted clicks only); the popup lists the
+  same media. YouTube is excluded.
+- *The button and the page.* The content script runs at `document_start` and
+  listens for click, mouse, pointer and touch events on `window` in the capture
+  phase, so it is the first listener to see them; an event aimed at the button
+  is stopped there and acted on by position. The page's own listeners (the
+  "open an advert on any click" kind) never see it. The button is shown in the
+  top layer (`popover`), above any z-index, so a layer the page keeps over its
+  player cannot cover it. One click sends the best offer; a second control
+  lists the others.
+- *Facebook.* The player is fed in pieces from script. Every address on
+  Facebook's video servers carries an `efg` parameter (base64 JSON: video
+  number, length in seconds, encoding), so the pieces being fetched identify
+  what is playing. The addresses of the whole files (picture and sound, HD and
+  SD) are in the data the page loads: `page-hook.js`, a content script in the
+  page's main world on `facebook.com` only, reads `browser_native_hd_url` /
+  `browser_native_sd_url` from embedded data and from `fetch` /
+  `XMLHttpRequest` responses and posts them to the isolated content script,
+  which relays them to the worker; the worker accepts only `https` addresses on
+  `fbcdn.net` that describe themselves. The length of the `<video>` under the
+  pointer selects the video; without a known length and with several videos in
+  the tab, the button waits instead of guessing. If the whole-file address is
+  unknown, the separate streams are offered, labelled "without sound".
+- Context-menu item "Download with RDM" for links, video, audio and images.
+- No host permission for the loopback address, a `default-src 'none'` content
+  security policy for extension pages, no remote code, no network requests.
+
+**Installing the extension.** On Windows, Chrome and Edge install an extension
+without user action only from their own stores (registry key
+`Software\<browser>\Extensions\<id>` with the store's `update_url`). The
+registration code writes those keys when `CHROME_STORE_ID` / `EDGE_STORE_ID`
+are set in `browser.rs`; until the extension is published it is loaded unpacked,
+guided by *Help → Browser integration*.
 
 ---
 
@@ -392,7 +448,12 @@ via the loopback API (single-instance application):
 
 `/d URL` download · `/p path` save dir · `/f name` file name · `/q` quit when
 done · `/n` silent (no dialogs) · `/a` add to queue without starting ·
-`/s` start main queue · `/h` hang up → not applicable, ignored.
+`/s` start main queue · `/h` hang up → not applicable, ignored ·
+`--browser-setup` open the browser integration guide.
+
+An instance is *the* running instance by holding the loopback port, which
+`rdm.exe` takes before creating its window; a second process forwards its
+arguments (authenticated with the secret in the data directory) and exits.
 
 `rdmc.exe` is a headless client: `rdmc get <url> [-o file] [-c N] [--limit RATE]`
 with a live progress line; used for benchmarks and automated tests.
@@ -440,7 +501,7 @@ server; until that is run, "matches IDM" is a design goal, not a measured claim.
 
 ## 13. Implementation status
 
-_As of 2026-10-12, version 0.1.0. "Verified" names how it was checked;
+_As of 2026-10-13, version 0.2.0. "Verified" names how it was checked;
 anything not listed as verified has been written but not exercised._
 
 | Milestone | State |
@@ -450,14 +511,14 @@ anything not listed as verified has been written but not exercised._
 | M3 Management | **Done** |
 | M4 Integration | **Done** |
 | M5 Media & grabber | **Partly done** — HLS and a single-page link grabber; no DASH, no FTP, no multi-level grabbing |
-| M6 Packaging | **Done** except code signing |
+| M6 Packaging | **Done**; signing is built in and tested, a certificate that Windows trusts has not been obtained |
 
 ### Verification suites
 | Suite | What it is | Size |
 |---|---|---|
-| `cargo test --workspace` | Unit tests, engine tests against the fault-injecting server, manager tests, HLS tests, click-through GUI tests | 82 tests |
-| `scripts/test-installer.ps1` | Silent install into a temp folder, run, uninstall | 34 checks |
-| `scripts/test-integration.ps1` | Clipboard monitoring, the extension in a real Edge, unattended `/n /q` | 10 checks |
+| `cargo test --workspace` | Unit tests, engine tests against the fault-injecting server, manager tests, HLS tests, click-through GUI tests, the native-messaging host | 100 tests |
+| `scripts/test-installer.ps1` | Silent install into a temp folder, browser registration, access rules of the local port, run, uninstall | 63 checks (71 for a signed build) |
+| `scripts/test-integration.ps1` | Clipboard monitoring, the extension in a real Edge (downloads, video button on a page that grabs clicks, Facebook-format data, RDM started on demand), unattended `/n /q` | 40 checks |
 
 ### Done and verified
 | Item | How it was verified |
@@ -480,11 +541,26 @@ anything not listed as verified has been written but not exercised._
 | Changing a download's address keeps progress | Manager test |
 | File naming, categories, unique names, list persistence, restart mid-download | Unit and manager tests |
 | Add URL → Download File Info → start → complete → delete; stop / resume; search, sort, category filter, context menu; scheduler dialog; options saved; batch; paste a link; captured downloads wait for confirmation | GUI tests that click the real interface (`egui_kittest`) |
-| Loopback API access rules, single-instance forwarding, `/d /p /f /n /a /s` | End-to-end checks against the release build |
+| Search (every word, all fields, match count, empty result, clear); hiding a progress window and bringing it back; the browser integration guide | GUI tests |
+| Loopback API access rules: secret required, browser origins and foreign `Host` refused, the old client header no longer enough | Unit test against a live listener; installer script against the installed application |
+| A browser request cannot choose the folder, skip the dialog, or inject headers | Unit test |
+| Cookies, passwords and custom headers are not sent to another site | Unit tests (scope rule; the requests actually built) |
+| Mark of the web on finished files | Unit test; integration script on a real download |
+| Passwords and cookies encrypted at rest (plain text from older files still read) | Unit test |
+| Native-messaging host: framing, size limit, malformed input, field validation | Unit tests |
+| Browser registration (manifest, registry), extension ID matches the manifest key | Unit tests in a scratch registry key; installer script on a real install and uninstall |
+| Single-instance forwarding, `/d /p /f /n /a /s` | End-to-end checks against the release build |
 | `/n /q` unattended download that exits when done | Integration script |
 | Clipboard monitoring | Integration script: ordinary text and page links ignored, a file link picked up |
-| Browser extension | Integration script: loaded into Microsoft Edge; a download created by the browser is handed to RDM and the browser's copy cancelled |
-| Installer / uninstaller | Installer script: files, Apps & features entry, shortcuts, closing a running instance, clean removal |
+| Browser extension: downloads | Integration script, Microsoft Edge, real mouse clicks on a page: a captured type reaches RDM through native messaging and leaves no file and no entry in the browser; a type that is not captured stays with the browser and is not offered to RDM |
+| Browser extension: button on videos | Integration script: the video is noticed, the button appears over it, its shadow tree is closed to the page, a click faked by the page does nothing, a real click sends the video to RDM |
+| Button on a hostile page | Integration script: the test page grabs every click to open a tab and keeps a layer over its player. The button stays reachable, the first real click sends the video, the page's handlers see no event, no tab opens. Run once with the script loaded after the page's (the earlier order): the click was swallowed and the page opened tabs |
+| Download link that opens a new tab | Integration script: goes to RDM, no empty tab is left |
+| Facebook: data format | Integration script with Facebook-format data from the test server: addresses read from `fetch` and `XMLHttpRequest` responses without altering what the page receives; the video is chosen by length; no guess when the length is unknown; addresses not on Facebook's servers refused |
+| Facebook: the real site | By hand, 2026-10-13, signed out, in the test browser: on a public video page the video was recognised (HD 720p and SD), the button appeared, one click handed the HD address to RDM with a readable file name; `rdmc` then downloaded that file completely (23,526,592 bytes, picture and sound tracks present). On a public reels page six videos were recognised and the one on screen was selected by its length |
+| RDM started on demand | Integration script: with RDM closed, a download in the browser starts it and is handed over, without a second copy in the browser |
+| Code signing pipeline | A build signed with a self-signed test certificate: the three executables, the uninstaller and the installer carry the signature and a time stamp (installer script, 70 checks) |
+| Installer / uninstaller | Installer script: files, Apps & features entry, shortcuts, closing a running instance, clean removal, a copy of RDM already running on the computer left alone |
 | Tray: start hidden, restore, quit while hidden | Installer script (window visibility checked through Win32) |
 | Icon and version information in the executables | Read back through Windows (`VersionInfo`, associated icon) |
 
@@ -505,20 +581,38 @@ anything not listed as verified has been written but not exercised._
 - Power actions after a queue (sleep / hibernate / shut down with a 60 s
   cancellable countdown) — deliberately not triggered on a development machine.
 - SOCKS5 and HTTPS proxies (the HTTP proxy path is tested).
-- The extension in Chrome (Chrome no longer loads unpacked extensions from the
-  command line, so only Edge could be automated) and in Firefox (needs a
-  manifest tweak).
-- A real link click in the browser: the integration test starts the download
-  through the browser's download API, which is the same path from
-  `downloads.onCreated` onward.
+- The extension in Chrome and Brave (Chrome no longer loads unpacked extensions
+  from the command line, so only Edge could be automated). There is no Firefox
+  version.
+- Facebook while signed in. The detection was run against two public pages
+  opened directly and signed out (a video page and a reels page; see "Done and
+  verified"). Videos that arrive while scrolling a signed-in feed come through
+  the `fetch` / `XMLHttpRequest` path, which is tested with Facebook-format
+  data from the local test server, not with Facebook's own traffic.
+- The button on other real video sites, and HLS-playlist detection against a
+  live site. Sites that feed their player from script without a playlist
+  (other than Facebook) are not detected.
+- The popup's media list and the extension's context-menu item.
+- The installer's last-resort force-close of its own copy (the command it runs
+  was checked on its own: it ends only the process with the matching path).
+- Registering the store extension IDs (`Software\<browser>\Extensions`): the
+  extension is not published, so there is no ID to register.
+- Hiding a progress window with a real tray icon and restoring it by clicking
+  the icon (the GUI test restores it through "Show progress").
 - "Start with Windows" (the installer writes the `Run` entry; signing in again
   to see it start was not tested).
 
 ### Not implemented
 - FTP / FTPS.
-- DASH (`.mpd`) streams; a "download this video" panel in the browser.
+- DASH (`.mpd`) streams; video from YouTube or DRM-protected players.
 - Multi-level site grabbing (the grabber reads one page).
-- Code signing (Windows SmartScreen warns on first run).
+- A trusted publisher: releases are unsigned until a certificate from a
+  certificate authority is obtained (Windows shows "Unknown publisher" and
+  SmartScreen warns on first run). `package.ps1 -Sign` does the rest.
+- One-click installation of the extension: needs a Chrome Web Store / Edge
+  Add-ons listing.
+- Capturing downloads that a page starts with a POST request (RDM would repeat
+  them as a GET).
 - Remembering a learned per-host connection ceiling across sessions
   (per-site limits are set by hand).
 - `/h` (hang up a modem connection) — obsolete, ignored.
@@ -526,7 +620,15 @@ anything not listed as verified has been written but not exercised._
 ### Known limitations
 - Hosts that punish parallel connections (lower total speed with 2 than with 1)
   are handled correctly but not optimally; pin them to 1 connection in Options.
-- Site-login and proxy passwords are stored unencrypted in `config.json`.
+- Site-login and proxy passwords, and the cookies of captured downloads, are
+  encrypted with Windows data protection — which protects them from other
+  accounts and from a copied settings folder, not from programs running as the
+  same user. A portable copy stores them as plain text.
+- "Same site" for cookies is decided without the public suffix list (last two
+  labels, or three under a short country-code second level); hosts under shared
+  suffixes such as `github.io` are treated as one site.
+- The media list of a tab is cleared on a page load, not on in-page navigation,
+  so a single-page site can show media from the previous view.
 - The build targets `x86_64-pc-windows-gnu` and needs the linker setup in
   `README.md`; for the same reason the executable icon is stamped in after
   linking by `crates/xtask`.

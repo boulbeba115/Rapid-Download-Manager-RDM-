@@ -23,6 +23,9 @@ pub struct ProgressWindow {
     limit_kb: u64,
     /// "Show the download-complete dialog" for this download.
     pub announce: bool,
+    /// Sent to the notification area: no window, the download carries on.
+    /// The tray icon (or "Show progress" on the row) brings it back.
+    pub hidden: bool,
 }
 
 fn percent(v: &View) -> Option<f32> {
@@ -45,12 +48,17 @@ pub fn status_text(v: &View) -> (String, Color32) {
 impl ProgressWindow {
     pub fn new(id: Id, view: Option<&View>, announce: bool) -> Self {
         let limit = view.map(|v| v.d.speed_limit).unwrap_or(0);
-        Self { id, tab: Tab::Status, show_details: true, limit_on: limit > 0, limit_kb: (limit / 1024).max(1), announce }
+        Self { id, tab: Tab::Status, show_details: true, limit_on: limit > 0, limit_kb: (limit / 1024).max(1), announce, hidden: false }
     }
 
-    /// Returns false once the window should go away.
-    pub fn show(&mut self, ctx: &egui::Context, manager: &Manager) -> bool {
+    /// Returns false once the window should go away. `tray` says whether there
+    /// is a notification-area icon to hide behind.
+    pub fn show(&mut self, ctx: &egui::Context, manager: &Manager, tray: bool) -> bool {
         let Some(v) = manager.view(self.id) else { return false };
+        if self.hidden {
+            // No window while hidden; the entry stays so its settings survive.
+            return true;
+        }
         let segments = manager.segments(self.id);
         let title = match percent(&v) {
             Some(p) => format!("{:.0}% {}", p.floor(), v.d.file_name),
@@ -71,7 +79,7 @@ impl ProgressWindow {
                 });
                 ui.separator();
                 match self.tab {
-                    Tab::Status => self.status_tab(ui, manager, &v, &segments, &mut keep),
+                    Tab::Status => self.status_tab(ui, manager, &v, &segments, tray, &mut keep),
                     Tab::Limiter => self.limiter_tab(ui, manager),
                     Tab::OnCompletion => {
                         ui.add_space(6.0);
@@ -88,7 +96,7 @@ impl ProgressWindow {
         keep
     }
 
-    fn status_tab(&mut self, ui: &mut egui::Ui, manager: &Manager, v: &View, segments: &[rdm_core::segment::SegSnapshot], keep: &mut bool) {
+    fn status_tab(&mut self, ui: &mut egui::Ui, manager: &Manager, v: &View, segments: &[rdm_core::segment::SegSnapshot], tray: bool, keep: &mut bool) {
         let (status, status_color) = status_text(v);
         egui::Grid::new("facts").num_columns(2).spacing([14.0, 5.0]).show(ui, |ui| {
             ui.label("Address");
@@ -158,6 +166,14 @@ impl ProgressWindow {
                             manager.start(self.id);
                         }
                     }
+                }
+                let hint = if tray {
+                    "Hide this window in the notification area (the hidden icons next to the clock).\nThe download carries on; click the RDM icon there to bring the window back."
+                } else {
+                    "Hide this window; the download carries on.\nRight-click the download and choose \"Show progress\" to bring it back."
+                };
+                if ui.add_sized([84.0, 24.0], egui::Button::new("Hide")).on_hover_text(hint).clicked() {
+                    self.hidden = true;
                 }
             });
         });

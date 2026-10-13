@@ -289,6 +289,99 @@ fn present(h: &Harness<'static, RdmApp>, label: &str) -> bool {
     h.query_all_by_label(label).next().is_some()
 }
 
+/// The search box narrows by every word typed, looks beyond the file name,
+/// says how many rows match, and explains an empty result.
+#[test]
+fn search_matches_every_word_and_can_be_cleared() {
+    let mut gui = Gui::new("search");
+    gui.queue("http://127.0.0.1:9/iso/ubuntu-24.04-desktop.iso", "ubuntu-24.04-desktop.iso");
+    gui.queue("http://127.0.0.1:9/iso/ubuntu-24.04-server.iso", "ubuntu-24.04-server.iso");
+    gui.queue("http://127.0.0.1:9/handbook/manual.pdf", "manual.pdf");
+    gui.until("the rows", 5, |h| present(h, "manual.pdf"));
+    let search = |gui: &mut Gui, text: &str| {
+        let field = gui.h.get_all_by_role(Role::TextInput).next().unwrap();
+        field.focus();
+        gui.steps(2);
+        gui.h.get_all_by_role(Role::TextInput).next().unwrap().type_text(text);
+        gui.steps(3);
+    };
+    assert!(!gui.has("Clear search"), "nothing to clear yet");
+
+    // Two words: both must match, in any order.
+    search(&mut gui, "SERVER ubuntu");
+    assert!(gui.has("ubuntu-24.04-server.iso"), "the matching row stays, and is still labelled by its full name");
+    assert!(!gui.has("ubuntu-24.04-desktop.iso") && !gui.has("manual.pdf"));
+    assert!(gui.has("1 match"));
+
+    // The × empties the field and everything is back.
+    gui.click("Clear search");
+    assert!(gui.has("ubuntu-24.04-desktop.iso") && gui.has("manual.pdf"));
+    assert!(!gui.has("1 match"));
+
+    // The address, the category and the status are searched too.
+    search(&mut gui, "handbook");
+    assert!(gui.has("manual.pdf") && !gui.has("ubuntu-24.04-server.iso"));
+    gui.click("Clear search");
+    search(&mut gui, "queued compressed");
+    assert!(gui.has("2 matches") && gui.has("ubuntu-24.04-server.iso") && !gui.has("manual.pdf"));
+    gui.click("Clear search");
+
+    // Nothing matches: say so, and offer the way back.
+    search(&mut gui, "no-such-file");
+    assert!(gui.has("No match") && gui.has("No downloads match \"no-such-file\""));
+    gui.click("Clear search");
+    gui.until("the list to return", 5, |h| present(h, "manual.pdf"));
+}
+
+/// "Hide" on the progress window takes the window away without touching the
+/// download, and it can be brought back.
+#[test]
+fn progress_window_hides_and_comes_back() {
+    let mut gui = Gui::new("hide");
+    let mut opts = ServerOptions::new(24 * MIB);
+    opts.per_conn_rate = 256 * 1024;
+    let server = gui.server(opts);
+    let mut new = NewDownload::new(RequestSpec::new(server.url()));
+    new.file_name = Some("slow.iso".into());
+    new.connections = Some(Connections::Fixed(2));
+    let id = gui.app().manager().add(new);
+    gui.until("the download to run", 20, |h| h.state().manager().view(id).is_some_and(|v| v.d.downloaded > 0));
+
+    let show_progress = |gui: &mut Gui| {
+        gui.h.get_by_label("slow.iso").click_secondary();
+        gui.steps(3);
+        gui.click("Show progress");
+    };
+    show_progress(&mut gui);
+    gui.until("the progress window", 5, |h| present(h, "Resume capability"));
+
+    gui.click("Hide");
+    gui.until("the window to go away", 5, |h| !present(h, "Resume capability"));
+    let before = gui.app().manager().view(id).unwrap();
+    assert_eq!(before.d.status, Status::Running, "hiding must not stop the download");
+    gui.until("the download to keep going while hidden", 20, |h| h.state().manager().view(id).unwrap().d.downloaded > before.d.downloaded);
+
+    show_progress(&mut gui);
+    gui.until("the progress window again", 5, |h| present(h, "Resume capability"));
+    gui.app().manager().pause(id);
+}
+
+/// The installer's last page (and Options) open the browser set-up guide.
+#[test]
+fn browser_setup_guide_opens_on_request() {
+    let mut gui = Gui::new("browser");
+    gui.app().manager().push_event(rdm_core::manager::Event::BrowserSetup);
+    gui.until("the guide", 5, |h| present(h, "2.  Add the extension to your browser"));
+    assert!(gui.has("Copy the folder path"));
+    gui.click("Close");
+    gui.until("the guide to close", 5, |h| !present(h, "2.  Add the extension to your browser"));
+
+    gui.click("Options");
+    gui.until("the options dialog", 5, |h| present(h, "Site logins"));
+    gui.click("Set up the browser extension…");
+    gui.until("the guide from Options", 5, |h| present(h, "2.  Add the extension to your browser"));
+}
+
 /// A download handed over by the browser or the clipboard must wait in the
 /// Download File Info dialog until the user decides — never start by itself.
 #[test]

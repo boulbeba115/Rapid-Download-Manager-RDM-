@@ -1,0 +1,18 @@
+:root { color-scheme: light dark; }
+body { font: 13px "Segoe UI", system-ui, sans-serif; width: 300px; margin: 12px; }
+header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+h1 { font-size: 14px; margin: 0; }
+h2 { font-size: 12px; margin: 12px 0 4px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+label { display: flex; align-items: center; gap: 6px; margin: 7px 0; }
+#status { margin-bottom: 8px; padding: 7px 9px; border-radius: 5px; background: #ececec; color: #333; line-height: 1.35; }
+#status.ok { background: #dff3e4; color: #1b6b34; }
+#status.idle { background: #e7effb; color: #174ea6; }
+#status.bad { background: #fbe3e3; color: #8a1f1f; }
+ul { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow: auto; }
+li { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px solid rgba(128, 128, 128, .25); }
+li .text { flex: 1; min-width: 0; }
+li .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+li .meta { font-size: 11px; opacity: .7; }
+li button { flex: none; font: inherit; padding: 4px 9px; border: 0; border-radius: 4px; background: #1565c0; color: #fff; cursor: pointer; }
+li button:hover { background: #1976d2; }
+li button:disabled { background: #7a7a7a; cursor: default; }

@@ -4,18 +4,23 @@
 
 .DESCRIPTION
     1. Builds the release binaries.
-    2. Stamps the icon and version information into rdm.exe and rdmc.exe.
-    3. Builds dist\RDM-<version>-Setup.exe with NSIS.
-    4. Builds dist\RDM-<version>-portable-win64.zip (settings stay next to the exe).
-    5. Writes dist\SHA256SUMS.txt.
+    2. Stamps the icon and version information into the executables.
+    3. With -Sign: signs them (Authenticode), and has the installer and the
+       uninstaller inside it signed as they are built.
+    4. Builds dist\RDM-<version>-Setup.exe with NSIS.
+    5. Builds dist\RDM-<version>-portable-win64.zip (settings stay next to the exe).
+    6. Writes dist\SHA256SUMS.txt.
 
     NSIS is looked up on PATH, then in tools\nsis-*\ (see README, "Packaging").
+    The signing certificate is named through the environment; see
+    scripts\sign.ps1 and README, "Signing".
 
 .EXAMPLE
     .\scripts\package.ps1
     .\scripts\package.ps1 -SkipBuild
+    $env:RDM_SIGN_THUMBPRINT = "<thumbprint>"; .\scripts\package.ps1 -Sign
 #>
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$Sign)
 
 $ErrorActionPreference = "Stop"
 
@@ -44,7 +49,8 @@ $version = (Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"').
 Write-Host "Packaging Rapid Download Manager $version"
 
 if (-not $SkipBuild) {
-    Invoke-Tool cargo @("build", "--release", "-p", "rdm-app", "-p", "rdm-cli", "-p", "xtask")
+    # --locked: build exactly the dependency versions recorded in Cargo.lock.
+    Invoke-Tool cargo @("build", "--release", "--locked", "-p", "rdm-app", "-p", "rdm-cli", "-p", "rdm-host", "-p", "xtask")
 }
 
 $release = Join-Path $root "target\release"
@@ -59,10 +65,20 @@ foreach ($dir in $stage, $tmp) {
 # ---- Stage the files that ship, and stamp the executables.
 $xtask = Join-Path $release "xtask.exe"
 $icon = Join-Path $tmp "rdm.ico"
-Copy-Item (Join-Path $release "rdm.exe"), (Join-Path $release "rdmc.exe") $stage
+Copy-Item (Join-Path $release "rdm.exe"), (Join-Path $release "rdmc.exe"), (Join-Path $release "rdm-host.exe") $stage
 Invoke-Tool $xtask @("stamp", (Join-Path $stage "rdm.exe"), "Rapid Download Manager")
 Invoke-Tool $xtask @("stamp", (Join-Path $stage "rdmc.exe"), "Rapid Download Manager command-line tool")
+Invoke-Tool $xtask @("stamp", (Join-Path $stage "rdm-host.exe"), "Rapid Download Manager browser host")
 Invoke-Tool $xtask @("icon", $icon)
+
+# ---- Sign the executables (after stamping: a signature covers the resources too).
+$signScript = Join-Path $PSScriptRoot "sign.ps1"
+if ($Sign) {
+    & $signScript (Join-Path $stage "rdm.exe") (Join-Path $stage "rdmc.exe") (Join-Path $stage "rdm-host.exe")
+}
+else {
+    Write-Host "Not signing (no -Sign): Windows will show these files as from an unknown publisher."
+}
 
 Copy-Item (Join-Path $root "LICENSE") (Join-Path $stage "LICENSE.txt")
 Copy-Item (Join-Path $root "README.md") $stage
@@ -80,7 +96,11 @@ if (-not $makensis) { throw "NSIS (makensis.exe) not found on PATH or under tool
 
 $setup = Join-Path $dist "RDM-$version-Setup.exe"
 $nsi = Join-Path $root "installer\rdm.nsi"
-Invoke-Tool $makensis @("/V2", "/DVERSION=$version", "/DSTAGE=$stage", "/DICON=$icon", "/DOUTFILE=$setup", $nsi)
+$nsisArgs = @("/V2", "/DVERSION=$version", "/DSTAGE=$stage", "/DICON=$icon", "/DOUTFILE=$setup")
+# The installer script signs the uninstaller and the finished installer itself.
+if ($Sign) { $nsisArgs += "/DSIGN_SCRIPT=$signScript" }
+Invoke-Tool $makensis ($nsisArgs + $nsi)
+if ($Sign -and -not (Get-AuthenticodeSignature $setup).SignerCertificate) { throw "The installer was built but carries no signature." }
 
 # ---- Portable zip: same files plus the marker that keeps settings beside the exe.
 $portableName = "RDM-$version-portable-win64"
@@ -90,6 +110,9 @@ Set-Content -Path (Join-Path $portableDir "portable.txt") -Encoding ascii -Value
     "This file makes Rapid Download Manager portable:"
     "settings and the download list are kept in the 'data' folder next to rdm.exe"
     "instead of %APPDATA%\RDM. Delete this file to use the normal location."
+    ""
+    "To use the browser extension with this copy, open Help > Browser integration"
+    "in RDM and click 'Connect the browsers to RDM'."
 )
 $zip = Join-Path $dist "$portableName.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }

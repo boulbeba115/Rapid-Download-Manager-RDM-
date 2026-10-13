@@ -177,7 +177,37 @@ pub fn verify_file(path: &Path, seed: u64, size: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// One video (number 4242424242, 136 s) with an HD and an SD file, and a second
+/// one (5151515151, 137 s): the keys and the self-describing `efg` parameter
+/// (base64 JSON: encoding, video number, length) as Facebook's pages carry them.
+const FB_DATA: &str = r#"{"data":{"video":{"id":"1","browser_native_hd_url":"https:\/\/video.test.fbcdn.net\/v\/hd-{VIA}.mp4?efg=eyJ2ZW5jb2RlX3RhZyI6Inhwdl9wcm9ncmVzc2l2ZS5GQUNFQk9PSy4uQzMuNzIwLmRhc2hfaDI2NC1iYXNpYy1nZW4yXzcyMHAiLCJ4cHZfYXNzZXRfaWQiOjQyNDI0MjQyNDIsImR1cmF0aW9uX3MiOjEzNn0&oh=1","browser_native_sd_url":"https:\/\/video.test.fbcdn.net\/v\/sd-{VIA}.mp4?efg=eyJ2ZW5jb2RlX3RhZyI6Inhwdl9wcm9ncmVzc2l2ZS5GQUNFQk9PSy4uQzMuMzYwLnN2ZV9zZCIsInhwdl9hc3NldF9pZCI6NDI0MjQyNDI0MiwiZHVyYXRpb25fcyI6MTM2fQ&oh=2"},"next":{"id":"2","browser_native_hd_url":null,"browser_native_sd_url":"https:\/\/video.test.fbcdn.net\/v\/other-{VIA}.mp4?efg=eyJ2ZW5jb2RlX3RhZyI6Inhwdl9wcm9ncmVzc2l2ZS5GQUNFQk9PSy4uQzMuMzYwLnN2ZV9zZCIsInhwdl9hc3NldF9pZCI6NTE1MTUxNTE1MSwiZHVyYXRpb25fcyI6MTM3fQ&oh=3"}}}"#;
+
+/// The page behaves the way advert-laden video sites do, because that is what
+/// the extension's button has to survive: it grabs every click anywhere on the
+/// page (opening a new tab and hiding the click from everything else), and it
+/// keeps an invisible layer on top of the player, above anything added later.
+const PLAYER_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>RDM test player</title>
+<body style="margin:0"><video id="v" src="movie.mp4" width="640" height="360" controls muted></video>
+<script>
+window.hijack = { seen: 0, opened: 0 };
+for (const type of ["click", "mousedown", "mouseup", "pointerdown", "pointerup"]) {
+  window.addEventListener(type, (event) => {
+    if (event.target && event.target.id === "rdm-test-link") return;
+    hijack.seen += 1;
+    if (type === "click") { hijack.opened += 1; window.open("about:blank"); }
+    event.stopImmediatePropagation();
+  }, true);
+}
+const layer = document.createElement("div");
+layer.id = "layer";
+layer.style.cssText = "position:fixed;left:0;top:0;width:640px;height:360px;z-index:2147483647";
+const keepOnTop = () => { if (document.documentElement.lastElementChild !== layer) document.documentElement.appendChild(layer); };
+new MutationObserver(keepOnTop).observe(document.documentElement, { childList: true });
+keepOnTop();
+</script></body>"#;
+
 struct Request {
+    path: String,
     range: Option<(u64, Option<u64>)>,
     if_range: Option<String>,
     authorization: Option<String>,
@@ -188,7 +218,8 @@ async fn read_request(stream: &mut TcpStream, carry: &mut Vec<u8>) -> Option<Req
         if let Some(end) = carry.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&carry[..end]).into_owned();
             carry.drain(..end + 4);
-            let mut req = Request { range: None, if_range: None, authorization: None };
+            let path = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/").to_string();
+            let mut req = Request { path, range: None, if_range: None, authorization: None };
             for line in head.lines().skip(1) {
                 let Some((k, v)) = line.split_once(':') else { continue };
                 let v = v.trim();
@@ -236,16 +267,36 @@ async fn serve_connection(mut stream: TcpStream, opts: Arc<Mutex<ServerOptions>>
             tokio::time::sleep(o.latency).await;
         }
 
+        // A page with a video on it, for testing the browser extension's page button.
+        // The video's address is `movie.mp4` on this server (random bytes, but the
+        // extension only cares that a <video> element asked for it).
+        if req.path.split('?').next().is_some_and(|p| p.ends_with("/player.html")) {
+            let body = PLAYER_PAGE;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n", body.len());
+            if stream.write_all(head.as_bytes()).await.is_err() || stream.write_all(body.as_bytes()).await.is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // Page data in the form Facebook sends it, for testing how the extension
+        // finds a video's whole-file addresses. `?via=x` makes the addresses distinct.
+        if req.path.split('?').next().is_some_and(|p| p.ends_with("/fb-data.json")) {
+            let via: String = req.path.split("via=").nth(1).unwrap_or("").chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            let body = FB_DATA.replace("{VIA}", &via);
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len());
+            if stream.write_all(head.as_bytes()).await.is_err() || stream.write_all(body.as_bytes()).await.is_err() {
+                return;
+            }
+            continue;
+        }
+
         if let Some((user, pass)) = &o.require_auth {
             use base64::Engine;
             let want = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}")));
             if req.authorization.as_deref() != Some(want.as_str()) {
                 stats.rejected.fetch_add(1, Ordering::Relaxed);
-                let head = "HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Basic realm=\"test\"
-Content-Length: 0
-
-";
+                let head = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n";
                 if stream.write_all(head.as_bytes()).await.is_err() {
                     return;
                 }

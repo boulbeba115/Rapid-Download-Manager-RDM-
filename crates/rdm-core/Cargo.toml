@@ -17,6 +17,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 dirs = "7.0.0"
 fastrand = "2.5.0"
 futures-util = "0.3.34"
+getrandom = "0.3.4"
 hex = "0.4.3"
 log = "0.4.34"
 md-5 = "0.11.0"
@@ -32,7 +33,7 @@ tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "
 url = "2.5.8"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Registry"] }
 
 [dev-dependencies]
 rdm-core = { path = ".", features = ["testserver"] }

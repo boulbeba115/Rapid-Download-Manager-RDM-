@@ -717,7 +717,7 @@ impl Task {
         };
 
         if fatal.is_none() && !paused && table.is_complete() && table.is_fully_written() {
-            if let Err(e) = finalize(&part, &cfg.final_path, &state_file, last_modified.as_deref(), cfg.set_file_time) {
+            if let Err(e) = finalize(&part, &cfg.final_path, &state_file, &cfg.spec.url, last_modified.as_deref(), cfg.set_file_time) {
                 return Once::Done(Outcome::Failed(format!("cannot save {}: {e}", cfg.final_path.display())));
             }
             self.progress.downloaded.store(table.fetched(), Ordering::Relaxed);
@@ -840,9 +840,11 @@ fn evict_slow(table: &SegmentTable, settle: Duration, after_secs: u32) {
     }
 }
 
-fn finalize(part: &Path, final_path: &Path, state_file: &Path, last_modified: Option<&str>, set_time: bool) -> std::io::Result<()> {
+fn finalize(part: &Path, final_path: &Path, state_file: &Path, url: &str, last_modified: Option<&str>, set_time: bool) -> std::io::Result<()> {
     std::fs::rename(part, final_path)?;
     let _ = std::fs::remove_file(state_file);
+    // Before the file time is set: writing the zone stream touches the modification time.
+    crate::security::mark_of_the_web(final_path, url);
     if set_time {
         if let Some(when) = last_modified.and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok()) {
             if let Ok(f) = std::fs::OpenOptions::new().write(true).open(final_path) {

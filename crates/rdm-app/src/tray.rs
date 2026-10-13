@@ -83,4 +83,9 @@ impl Tray {
     pub fn poll(&self) -> Vec<TrayAction> {
         self.actions.try_iter().collect()
     }
+
+    /// What hovering over the icon shows.
+    pub fn set_tooltip(&self, text: &str) {
+        let _ = self._icon.set_tooltip(Some(text));
+    }
 }
